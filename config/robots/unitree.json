@@ -15,8 +15,27 @@
     "tfStatic": "/tf_static",
     "odom": "/odom",
     "cmdVel": "/cmd_vel",
+    "pointCloud": "/camera/depth/color/points",
+    "depthCameraInfo": "/camera/depth/camera_info",
     "lowState": "/lowstate",
     "lowStateLf": "/lf/lowstate"
+  },
+  "depthSensor": {
+    "label": "RealSense D435i depth",
+    "pointCloudTopic": "/camera/depth/color/points",
+    "preferredFrames": [
+      "camera_depth_optical_frame",
+      "camera_color_optical_frame",
+      "realsense_depth_optical_frame"
+    ],
+    "fallbackParentFrame": "base",
+    "fallbackOpticalFrame": "camera_depth_optical_frame",
+    "fallbackOrigin": [0.28, 0.0, 0.18],
+    "horizontalFovDeg": 87,
+    "verticalFovDeg": 58,
+    "nearMeters": 0.18,
+    "farMeters": 3.0,
+    "maxPoints": 2400
   },
   "lowStateJointNames": [
     "FL_hip_joint",

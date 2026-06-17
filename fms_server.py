@@ -265,8 +265,14 @@ class RosMonitor:
         self.error = ""
         self.last_joint_time = 0.0
         self.last_tf_time = 0.0
+        self.last_depth_time = 0.0
         self.joints: dict[str, float] = {}
         self.transforms: list[dict[str, Any]] = []
+        self.depth_frame = ""
+        self.depth_points: list[list[float]] = []
+        self.depth_error = ""
+        self.depth_total = 0
+        self.depth_nearest = 0.0
         self.thread = threading.Thread(target=self._run, name="fms-ros-monitor", daemon=True)
 
     def start(self) -> None:
@@ -285,6 +291,21 @@ class RosMonitor:
                 "transforms": self.transforms[-200:],
             }
 
+    def depth_snapshot(self) -> dict[str, Any]:
+        robot = robot_configs().get(self.robot_id, {})
+        depth = robot.get("depthSensor", {})
+        with self.lock:
+            return {
+                "source": "live" if self.last_depth_time else "waiting",
+                "error": self.depth_error,
+                "frameId": self.depth_frame or depth.get("fallbackOpticalFrame", ""),
+                "lastDepthTime": self.last_depth_time,
+                "points": self.depth_points,
+                "total": self.depth_total,
+                "nearestMeters": self.depth_nearest,
+                "config": depth,
+            }
+
     def _run(self) -> None:
         if os.getenv("FMS_ENABLE_ROS", "1") == "0":
             with self.lock:
@@ -301,6 +322,18 @@ class RosMonitor:
                 self.error = f"{type(exc).__name__}: {exc}"
             return
 
+        point_cloud2 = None
+        PointCloud2 = None
+        try:
+            from sensor_msgs.msg import PointCloud2 as RosPointCloud2
+            from sensor_msgs_py import point_cloud2 as ros_point_cloud2
+
+            PointCloud2 = RosPointCloud2
+            point_cloud2 = ros_point_cloud2
+        except Exception as exc:
+            with self.lock:
+                self.depth_error = f"PointCloud2 unavailable: {type(exc).__name__}: {exc}"
+
         robots = robot_configs()
         robot = robots.get(self.robot_id) or robots.get("unitree") or {}
         topics = robot.get("topics", {})
@@ -310,6 +343,9 @@ class RosMonitor:
         low_state_topic = topics.get("lowState", "")
         low_state_lf_topic = topics.get("lowStateLf", "")
         low_state_joint_names = [name for name in robot.get("lowStateJointNames", []) if name]
+        depth_config = robot.get("depthSensor", {})
+        point_cloud_topic = depth_config.get("pointCloudTopic") or topics.get("pointCloud", "")
+        max_depth_points = max(100, min(12000, int(depth_config.get("maxPoints", 2400))))
 
         low_state_msg_type = None
         low_state_error = ""
@@ -330,6 +366,8 @@ class RosMonitor:
                     node_self.create_subscription(JointState, joint_topic, node_self.on_joint, 20)
                     node_self.create_subscription(TFMessage, tf_topic, node_self.on_tf, 20)
                     node_self.create_subscription(TFMessage, tf_static_topic, node_self.on_tf, 10)
+                    if point_cloud_topic and PointCloud2 is not None:
+                        node_self.create_subscription(PointCloud2, point_cloud_topic, node_self.on_point_cloud, 5)
                     if low_state_msg_type and low_state_joint_names:
                         for topic in {low_state_topic, low_state_lf_topic} - {""}:
                             node_self.create_subscription(low_state_msg_type, topic, node_self.on_low_state, 20)
@@ -384,6 +422,37 @@ class RosMonitor:
                         self.last_tf_time = now
                         if self.source != "live":
                             self.source = "tf"
+
+                def on_point_cloud(node_self, msg):
+                    now = time.time()
+                    total = int(msg.width or 0) * int(msg.height or 0)
+                    stride = max(1, total // max_depth_points) if total else 1
+                    points: list[list[float]] = []
+                    nearest = 0.0
+                    try:
+                        for index, point in enumerate(point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)):
+                            if index % stride:
+                                continue
+                            x, y, z = float(point[0]), float(point[1]), float(point[2])
+                            if not np.isfinite([x, y, z]).all():
+                                continue
+                            distance = float((x * x + y * y + z * z) ** 0.5)
+                            if distance <= 0.05 or distance > 8.0:
+                                continue
+                            nearest = distance if nearest <= 0.0 else min(nearest, distance)
+                            points.append([round(x, 4), round(y, 4), round(z, 4)])
+                            if len(points) >= max_depth_points:
+                                break
+                        with self.lock:
+                            self.depth_points = points
+                            self.depth_frame = msg.header.frame_id
+                            self.last_depth_time = now
+                            self.depth_total = total
+                            self.depth_nearest = round(nearest, 3)
+                            self.depth_error = ""
+                    except Exception as exc:
+                        with self.lock:
+                            self.depth_error = f"{type(exc).__name__}: {exc}"
 
             node = FmsRosNode()
             with self.lock:
@@ -506,6 +575,13 @@ def get_robot_state() -> JSONResponse:
     if _ROS_MONITOR is None:
         return JSONResponse({"source": "not-started", "joints": {}, "transforms": []})
     return JSONResponse(_ROS_MONITOR.snapshot())
+
+
+@app.get("/api/depth-state")
+def get_depth_state() -> JSONResponse:
+    if _ROS_MONITOR is None:
+        return JSONResponse({"source": "not-started", "points": [], "config": {}})
+    return JSONResponse(_ROS_MONITOR.depth_snapshot())
 
 
 @app.get("/api/status")

@@ -11,11 +11,15 @@ const state = {
   lastStatusAt: 0,
   urdf: null,
   robotState: null,
+  depthState: null,
   mesh: {
     renderer: null,
     scene: null,
     camera: null,
     root: null,
+    depthGroup: null,
+    depthPoints: null,
+    depthFrustum: null,
     links: new Map(),
     stlLoader: new STLLoader(),
     colladaLoader: new ColladaLoader(),
@@ -65,9 +69,11 @@ async function boot() {
   await loadUrdf();
   await refreshStatus();
   await refreshRobotState();
+  await refreshDepthState();
   setupInteractions();
   setInterval(refreshStatus, 2500);
   setInterval(refreshRobotState, 80);
+  setInterval(refreshDepthState, 180);
   setInterval(updateClock, 500);
   requestAnimationFrame(renderScene);
 }
@@ -140,6 +146,34 @@ async function refreshRobotState() {
     state.robotState = { source: "offline", joints: {}, transforms: [] };
     setText("#scene-source", "state offline");
   }
+}
+
+async function refreshDepthState() {
+  try {
+    state.depthState = await fetchJson("/api/depth-state");
+    updateDepthGeometry();
+    renderDepthLabel();
+  } catch (error) {
+    state.depthState = { source: "offline", points: [], config: {} };
+    setText("#scene-depth", "depth offline");
+  }
+}
+
+function renderDepthLabel() {
+  const depth = state.depthState || {};
+  const points = depth.points || [];
+  if (depth.error) {
+    setText("#scene-depth", depth.error.slice(0, 58));
+    return;
+  }
+  if (!depth.lastDepthTime || !points.length) {
+    const topic = depth.config?.pointCloudTopic || state.config?.robots?.[state.robotId]?.topics?.pointCloud || "depth";
+    setText("#scene-depth", `${topic} waiting`);
+    return;
+  }
+  const age = Math.max(0, Date.now() / 1000 - depth.lastDepthTime).toFixed(1);
+  const nearest = depth.nearestMeters ? ` near ${Number(depth.nearestMeters).toFixed(2)}m` : "";
+  setText("#scene-depth", `${points.length} pts${nearest} / ${normalizeFrameId(depth.frameId)} / ${age}s`);
 }
 
 function parseVector(value, fallback = [0, 0, 0]) {
@@ -529,6 +563,15 @@ function matQuat([x, y, z, w]) {
   ];
 }
 
+function matOpticalToRobotForward() {
+  return [
+    0, 0, 1, 0,
+    -1, 0, 0, 0,
+    0, -1, 0, 0,
+    0, 0, 0, 1,
+  ];
+}
+
 function normalizeFrameId(frameId) {
   return String(frameId || "").replace(/^\/+/, "");
 }
@@ -591,6 +634,46 @@ function buildUrdfFrames() {
   return { frames, edges };
 }
 
+function buildSceneFrames() {
+  const urdfFrames = buildUrdfFrames();
+  if (!urdfFrames) return new Map();
+  const frames = new Map(urdfFrames.frames);
+  const transforms = tfByChild();
+  let changed = true;
+  let guard = 0;
+  while (changed && guard < 80) {
+    changed = false;
+    guard += 1;
+    transforms.forEach((tf, child) => {
+      if (frames.has(child) || !frames.has(tf.parent)) return;
+      frames.set(child, matMul(frames.get(tf.parent), tf.local));
+      changed = true;
+    });
+  }
+  return frames;
+}
+
+function depthFrameMatrix() {
+  if (!state.urdf) return null;
+  const depth = state.depthState || {};
+  const config = depth.config || state.config?.robots?.[state.robotId]?.depthSensor || {};
+  const frames = buildSceneFrames();
+  const frame = normalizeFrameId(depth.frameId);
+  if (frame && frames.has(frame)) return frames.get(frame);
+
+  const preferred = config.preferredFrames || [];
+  for (const candidate of preferred) {
+    const normalized = normalizeFrameId(candidate);
+    if (frames.has(normalized)) return frames.get(normalized);
+  }
+
+  const parent = normalizeFrameId(config.fallbackParentFrame || state.urdf.root);
+  const parentMatrix = frames.get(parent) || matIdentity();
+  const origin = Array.isArray(config.fallbackOrigin) ? config.fallbackOrigin : [0.28, 0, 0.18];
+  const rpy = Array.isArray(config.fallbackRpy) ? config.fallbackRpy : [0, 0, 0];
+  return matMul(parentMatrix, matMul(matMul(matTranslate(origin), matRpy(rpy)), matOpticalToRobotForward()));
+}
+
 function initMeshViewer() {
   const canvas = $("#scene-canvas");
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
@@ -621,10 +704,33 @@ function initMeshViewer() {
   root.rotation.x = -Math.PI / 2;
   scene.add(root);
 
+  const depthGroup = new THREE.Group();
+  depthGroup.matrixAutoUpdate = false;
+  const pointGeometry = new THREE.BufferGeometry();
+  const pointMaterial = new THREE.PointsMaterial({
+    size: 0.018,
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.92,
+    depthWrite: false,
+  });
+  const depthPoints = new THREE.Points(pointGeometry, pointMaterial);
+  depthPoints.frustumCulled = false;
+  depthGroup.add(depthPoints);
+  const frustumGeometry = new THREE.BufferGeometry();
+  const frustumMaterial = new THREE.LineBasicMaterial({ color: 0x5ee493, transparent: true, opacity: 0.72 });
+  const depthFrustum = new THREE.LineSegments(frustumGeometry, frustumMaterial);
+  depthFrustum.frustumCulled = false;
+  depthGroup.add(depthFrustum);
+  root.add(depthGroup);
+
   state.mesh.renderer = renderer;
   state.mesh.scene = scene;
   state.mesh.camera = camera;
   state.mesh.root = root;
+  state.mesh.depthGroup = depthGroup;
+  state.mesh.depthPoints = depthPoints;
+  state.mesh.depthFrustum = depthFrustum;
   resizeRenderer();
   window.addEventListener("resize", resizeRenderer);
 }
@@ -660,7 +766,7 @@ function resolveMeshUrl(filename) {
 
 function clearRobotMeshes() {
   if (!state.mesh.root) return;
-  state.mesh.root.clear();
+  state.mesh.links.forEach((group) => state.mesh.root.remove(group));
   state.mesh.links.clear();
 }
 
@@ -731,6 +837,76 @@ async function objectForMeshUrl(url, linkName) {
   return cloneWithRuntimeMaterial(asset, linkName);
 }
 
+function depthColor(depth, near, far) {
+  const t = Math.max(0, Math.min(1, (depth - near) / Math.max(0.001, far - near)));
+  if (t < 0.35) return [1.0, 0.36 + t, 0.2];
+  if (t < 0.72) return [0.25, 0.92, 0.72 + (t - 0.35) * 0.55];
+  return [0.35, 0.7 - (t - 0.72) * 0.55, 1.0];
+}
+
+function updateDepthGeometry() {
+  const { depthPoints, depthFrustum } = state.mesh;
+  if (!depthPoints || !depthFrustum) return;
+  const depth = state.depthState || {};
+  const config = depth.config || state.config?.robots?.[state.robotId]?.depthSensor || {};
+  const near = Number(config.nearMeters || 0.18);
+  const far = Number(config.farMeters || 3.0);
+  const hFov = THREE.MathUtils.degToRad(Number(config.horizontalFovDeg || 87));
+  const vFov = THREE.MathUtils.degToRad(Number(config.verticalFovDeg || 58));
+  const x = Math.tan(hFov / 2) * far;
+  const y = Math.tan(vFov / 2) * far;
+  const corners = [
+    [-x, -y, far],
+    [x, -y, far],
+    [x, y, far],
+    [-x, y, far],
+  ];
+  const lines = [
+    [0, 0, 0], corners[0],
+    [0, 0, 0], corners[1],
+    [0, 0, 0], corners[2],
+    [0, 0, 0], corners[3],
+    corners[0], corners[1],
+    corners[1], corners[2],
+    corners[2], corners[3],
+    corners[3], corners[0],
+  ].flat();
+  depthFrustum.geometry.setAttribute("position", new THREE.Float32BufferAttribute(lines, 3));
+  depthFrustum.geometry.computeBoundingSphere();
+
+  const points = Array.isArray(depth.points) ? depth.points : [];
+  const positions = new Float32Array(points.length * 3);
+  const colors = new Float32Array(points.length * 3);
+  points.forEach((point, index) => {
+    const px = Number(point[0] || 0);
+    const py = Number(point[1] || 0);
+    const pz = Number(point[2] || 0);
+    positions[index * 3] = px;
+    positions[index * 3 + 1] = py;
+    positions[index * 3 + 2] = pz;
+    const color = depthColor(Math.hypot(px, py, pz), near, far);
+    colors[index * 3] = color[0];
+    colors[index * 3 + 1] = color[1];
+    colors[index * 3 + 2] = color[2];
+  });
+  depthPoints.geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  depthPoints.geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  depthPoints.geometry.computeBoundingSphere();
+}
+
+function updateDepthPose() {
+  const { depthGroup } = state.mesh;
+  if (!depthGroup) return;
+  const matrix = depthFrameMatrix();
+  if (!matrix) {
+    depthGroup.visible = false;
+    return;
+  }
+  depthGroup.visible = true;
+  depthGroup.matrix.copy(matrixFromUrdf(matrix));
+  depthGroup.matrixWorldNeedsUpdate = true;
+}
+
 async function loadRobotMeshes() {
   const token = ++state.mesh.loadToken;
   clearRobotMeshes();
@@ -783,6 +959,7 @@ function updateRobotMeshTransforms() {
     group.matrix.copy(matrixFromUrdf(matrix));
     group.matrixWorldNeedsUpdate = true;
   });
+  updateDepthPose();
   groundRobotOnGrid();
 }
 
@@ -791,8 +968,15 @@ function groundRobotOnGrid() {
   if (!root) return;
   root.position.y = 0;
   root.updateMatrixWorld(true);
-  const box = new THREE.Box3().setFromObject(root);
-  if (!Number.isFinite(box.min.y) || box.isEmpty()) return;
+  const box = new THREE.Box3();
+  let hasRobotMesh = false;
+  state.mesh.links.forEach((group) => {
+    const linkBox = new THREE.Box3().setFromObject(group);
+    if (!Number.isFinite(linkBox.min.y) || linkBox.isEmpty()) return;
+    box.union(linkBox);
+    hasRobotMesh = true;
+  });
+  if (!hasRobotMesh || box.isEmpty()) return;
   root.position.y = Math.max(0, -box.min.y + 0.015);
   root.updateMatrixWorld(true);
 }
