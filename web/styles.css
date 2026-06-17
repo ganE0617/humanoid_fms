@@ -466,9 +466,15 @@ select {
   width: 100%;
   height: 100%;
   display: block;
+  cursor: grab;
+  touch-action: none;
   background:
     linear-gradient(180deg, #101821, #080b0f 68%),
   #080b0f;
+}
+
+#scene-canvas:active {
+  cursor: grabbing;
 }
 
 .mission-panel {

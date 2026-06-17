@@ -21,6 +21,18 @@ const state = {
     depthGroup: null,
     depthPoints: null,
     depthFrustum: null,
+    controls: {
+      target: new THREE.Vector3(0, 0.45, 0),
+      distance: 3.2,
+      minDistance: 0.25,
+      maxDistance: 12,
+      yaw: 0.78,
+      pitch: 0.34,
+      pointerId: null,
+      mode: "rotate",
+      lastX: 0,
+      lastY: 0,
+    },
     links: new Map(),
     stlLoader: new STLLoader(),
     colladaLoader: new ColladaLoader(),
@@ -789,8 +801,103 @@ function initMeshViewer() {
   state.mesh.depthGroup = depthGroup;
   state.mesh.depthPoints = depthPoints;
   state.mesh.depthFrustum = depthFrustum;
+  updateOrbitCamera();
+  bindSceneControls(canvas);
   resizeRenderer();
   window.addEventListener("resize", resizeRenderer);
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function updateOrbitCamera() {
+  const { camera, controls } = state.mesh;
+  if (!camera || !controls) return;
+  const pitch = clamp(controls.pitch, -1.22, 1.22);
+  controls.pitch = pitch;
+  controls.distance = clamp(controls.distance, controls.minDistance, controls.maxDistance);
+  const cosPitch = Math.cos(pitch);
+  camera.position.set(
+    controls.target.x + controls.distance * Math.sin(controls.yaw) * cosPitch,
+    controls.target.y + controls.distance * Math.sin(pitch),
+    controls.target.z + controls.distance * Math.cos(controls.yaw) * cosPitch,
+  );
+  camera.lookAt(controls.target);
+}
+
+function panOrbitTarget(dx, dy) {
+  const { camera, controls } = state.mesh;
+  if (!camera || !controls) return;
+  const canvas = camera.parent?.domElement || state.mesh.renderer?.domElement;
+  const height = Math.max(1, canvas?.clientHeight || 1);
+  const scale = controls.distance / height;
+  const forward = new THREE.Vector3();
+  camera.getWorldDirection(forward);
+  const right = new THREE.Vector3().crossVectors(forward, camera.up).normalize();
+  const up = new THREE.Vector3().crossVectors(right, forward).normalize();
+  controls.target.addScaledVector(right, dx * scale);
+  controls.target.addScaledVector(up, dy * scale);
+  updateOrbitCamera();
+}
+
+function zoomOrbit(deltaY) {
+  const controls = state.mesh.controls;
+  if (!controls) return;
+  controls.distance = clamp(
+    controls.distance * Math.exp(deltaY * 0.0012),
+    controls.minDistance,
+    controls.maxDistance,
+  );
+  updateOrbitCamera();
+}
+
+function bindSceneControls(canvas) {
+  canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+  canvas.addEventListener(
+    "wheel",
+    (event) => {
+      event.preventDefault();
+      zoomOrbit(event.deltaY);
+    },
+    { passive: false },
+  );
+  canvas.addEventListener("pointerdown", (event) => {
+    const controls = state.mesh.controls;
+    controls.pointerId = event.pointerId;
+    controls.mode = event.button === 2 || event.shiftKey ? "pan" : "rotate";
+    controls.lastX = event.clientX;
+    controls.lastY = event.clientY;
+    canvas.setPointerCapture(event.pointerId);
+  });
+  canvas.addEventListener("pointermove", (event) => {
+    const controls = state.mesh.controls;
+    if (controls.pointerId !== event.pointerId) return;
+    const dx = event.clientX - controls.lastX;
+    const dy = event.clientY - controls.lastY;
+    controls.lastX = event.clientX;
+    controls.lastY = event.clientY;
+    if (controls.mode === "pan") {
+      panOrbitTarget(-dx, dy);
+      return;
+    }
+    controls.yaw -= dx * 0.006;
+    controls.pitch = clamp(controls.pitch - dy * 0.006, -1.22, 1.22);
+    updateOrbitCamera();
+  });
+  ["pointerup", "pointercancel", "pointerleave"].forEach((eventName) => {
+    canvas.addEventListener(eventName, (event) => {
+      const controls = state.mesh.controls;
+      if (controls.pointerId !== event.pointerId) return;
+      controls.pointerId = null;
+      try {
+        canvas.releasePointerCapture(event.pointerId);
+      } catch (error) {
+        // Pointer capture can already be released by the browser.
+      }
+    });
+  });
+  canvas.addEventListener("dblclick", fitCameraToRobot);
 }
 
 function matrixFromUrdf(values) {
@@ -1052,13 +1159,16 @@ function fitCameraToRobot() {
   box.getSize(size);
   const maxDim = Math.max(size.x, size.y, size.z, 0.45);
   const distance = Math.max(1.2, maxDim * 1.55);
+  const target = new THREE.Vector3(center.x, center.y + size.y * 0.08, center.z);
 
-  camera.position.set(
-    center.x + distance * 0.95,
-    center.y + Math.max(0.45, maxDim * 0.55),
-    center.z + distance * 1.05,
-  );
-  camera.lookAt(center.x, center.y + size.y * 0.08, center.z);
+  const controls = state.mesh.controls;
+  controls.target.copy(target);
+  controls.distance = distance * 1.58;
+  controls.minDistance = Math.max(0.08, maxDim * 0.22);
+  controls.maxDistance = Math.max(10, distance * 6);
+  controls.yaw = 0.74;
+  controls.pitch = Math.atan2(Math.max(0.45, maxDim * 0.55), distance * 1.1);
+  updateOrbitCamera();
   camera.near = Math.max(0.01, distance / 100);
   camera.far = Math.max(20, distance * 8);
   camera.updateProjectionMatrix();
