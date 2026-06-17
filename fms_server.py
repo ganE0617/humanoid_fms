@@ -320,7 +320,7 @@ def depth_points_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[li
     nearest = float(np.min(distances)) if distances.size else 0.0
     points = np.column_stack((x, y, z)).round(4).astype(float).tolist() if vs.size else []
 
-    step = max(4, min(32, int(config.get("surfaceStep", 8))))
+    step = max(2, min(32, int(config.get("surfaceStep", 8))))
     rows = int(np.ceil(height / step))
     cols = int(np.ceil(width / step))
     surface_points: list[list[float] | None] = []

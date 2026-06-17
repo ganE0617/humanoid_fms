@@ -13,6 +13,13 @@ const state = {
   robotState: null,
   depthState: null,
   missionState: null,
+  stableRobotState: {
+    joints: {},
+    transforms: [],
+    defaultJoints: {},
+    lastJointTime: 0,
+    lastTfTime: 0,
+  },
   mesh: {
     renderer: null,
     scene: null,
@@ -154,7 +161,7 @@ async function loadUrdf() {
 
 async function refreshRobotState() {
   try {
-    state.robotState = await fetchJson("/api/robot-state");
+    state.robotState = stabilizeRobotState(await fetchJson("/api/robot-state"));
     const source = state.robotState.source || "unknown";
     const age = state.robotState.lastJointTime
       ? `${Math.max(0, Date.now() / 1000 - state.robotState.lastJointTime).toFixed(1)}s`
@@ -163,6 +170,9 @@ async function refreshRobotState() {
       ? `${Math.max(0, Date.now() / 1000 - state.robotState.lastTfTime).toFixed(1)}s`
       : "";
     const label =
+      state.robotState.holdingPose
+        ? `holding last pose ${age || tfAge}`
+        :
       source === "live"
         ? `live /joint_states ${age}`
         : source === "lowstate"
@@ -172,9 +182,49 @@ async function refreshRobotState() {
           : "waiting for /joint_states or /tf";
     setText("#scene-source", label.trim());
   } catch (error) {
-    state.robotState = { source: "offline", joints: {}, transforms: [] };
-    setText("#scene-source", "state offline");
+    state.robotState = stabilizeRobotState({ source: "offline", error: String(error), joints: {}, transforms: [] });
+    const age = state.robotState.lastJointTime
+      ? `${Math.max(0, Date.now() / 1000 - state.robotState.lastJointTime).toFixed(1)}s`
+      : "";
+    setText("#scene-source", state.robotState.holdingPose ? `holding last pose ${age}` : "state offline");
   }
+}
+
+function stabilizeRobotState(payload) {
+  const cache = state.stableRobotState;
+  const now = Date.now() / 1000;
+  const incomingJoints = payload?.joints || {};
+  const incomingTransforms = Array.isArray(payload?.transforms) ? payload.transforms : [];
+  const hasJoints = Object.keys(incomingJoints).length > 0 && Number(payload?.lastJointTime || 0) > 0;
+  const hasTransforms = incomingTransforms.length > 0 && Number(payload?.lastTfTime || 0) > 0;
+
+  if (payload?.defaultJoints) cache.defaultJoints = payload.defaultJoints;
+  if (hasJoints) {
+    cache.joints = { ...cache.joints, ...incomingJoints };
+    cache.lastJointTime = Number(payload.lastJointTime || now);
+  }
+  if (hasTransforms) {
+    cache.transforms = incomingTransforms;
+    cache.lastTfTime = Number(payload.lastTfTime || now);
+  }
+
+  const joints = hasJoints ? { ...cache.joints, ...incomingJoints } : cache.joints;
+  const transforms = hasTransforms ? incomingTransforms : cache.transforms;
+  const lastJointTime = hasJoints ? Number(payload.lastJointTime || cache.lastJointTime) : cache.lastJointTime;
+  const lastTfTime = hasTransforms ? Number(payload.lastTfTime || cache.lastTfTime) : cache.lastTfTime;
+  const hasCachedPose = Object.keys(joints || {}).length > 0 || (transforms || []).length > 0;
+  const jointAge = lastJointTime ? now - lastJointTime : Infinity;
+  const tfAge = lastTfTime ? now - lastTfTime : Infinity;
+  return {
+    ...payload,
+    source: payload?.source || (hasCachedPose ? "holding" : "waiting"),
+    defaultJoints: cache.defaultJoints || payload?.defaultJoints || {},
+    joints: joints || {},
+    transforms: transforms || [],
+    lastJointTime,
+    lastTfTime,
+    holdingPose: hasCachedPose && (!hasJoints || !hasTransforms || Math.min(jointAge, tfAge) > 0.6 || payload?.source === "offline"),
+  };
 }
 
 async function refreshDepthState() {
