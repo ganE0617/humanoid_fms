@@ -1,20 +1,22 @@
 {
   "id": "unitree",
-  "label": "Unitree",
-  "description": "Initial integration target for local teleop testing.",
+  "label": "Unitree G1",
+  "model": "G1 29DOF",
+  "repo": "unitreerobotics/unitree_ros",
+  "description": "Unitree G1 29DOF URDF from the official unitree_ros repository.",
   "urdf": {
     "source": "unitreerobotics/unitree_ros",
     "path": "vendor/unitree_ros/robots/g1_description/g1_29dof.urdf",
-    "rootFrame": "base_link"
+    "rootFrame": "pelvis"
   },
   "topics": {
     "jointStates": "/joint_states",
     "tf": "/tf",
     "tfStatic": "/tf_static",
-    "odom": "/odom",
+    "odom": "/utlidar/robot_odom",
     "cmdVel": "/cmd_vel",
-    "pointCloud": "/camera/depth/color/points",
-    "depthImage": "/camera/depth/image_rect_raw"
+    "lowState": "/lowstate",
+    "lowStateLf": "/lf/lowstate"
   },
   "cameraSlots": [
     "logitech_front",

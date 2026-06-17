@@ -82,13 +82,15 @@ async function loadUrdf() {
   try {
     const payload = await fetchJson(`/api/robots/${state.robotId}/urdf`);
     state.urdf = parseUrdf(payload);
-    setText("#scene-root", state.urdf.root || payload.rootFrame || "root");
-    setText("#scene-joints", `${state.urdf.joints.length} joints`);
+    setText("#scene-root", `${state.urdf.model || state.config.robots[state.robotId].label} / ${state.urdf.root || payload.rootFrame || "root"}`);
+    setText("#scene-joints", `${state.urdf.movingJoints.length}/${state.urdf.joints.length} moving joints`);
+    setText("#scene-links", `${state.urdf.links.size} links`);
   } catch (error) {
     state.urdf = null;
     setText("#scene-root", "URDF missing");
     setText("#scene-source", "run sync script");
     setText("#scene-joints", "0 joints");
+    setText("#scene-links", "0 links");
     console.error(error);
   }
 }
@@ -100,7 +102,16 @@ async function refreshRobotState() {
     const age = state.robotState.lastJointTime
       ? `${Math.max(0, Date.now() / 1000 - state.robotState.lastJointTime).toFixed(1)}s`
       : "";
-    setText("#scene-source", `${source}${age ? ` ${age}` : ""}`);
+    const tfAge = state.robotState.lastTfTime
+      ? `${Math.max(0, Date.now() / 1000 - state.robotState.lastTfTime).toFixed(1)}s`
+      : "";
+    const label =
+      source === "live"
+        ? `live /joint_states ${age}`
+        : source === "tf"
+          ? `live /tf ${tfAge}`
+          : "waiting for /joint_states or /tf";
+    setText("#scene-source", label.trim());
   } catch (error) {
     state.robotState = { source: "offline", joints: {}, transforms: [] };
     setText("#scene-source", "state offline");
@@ -138,14 +149,42 @@ function parseUrdf(payload) {
     if (!children.has(joint.parent)) children.set(joint.parent, []);
     children.get(joint.parent).push(joint);
   });
-  const root = [...links].find((link) => !childLinks.has(link)) || payload.rootFrame || "base_link";
-  return { path: payload.path, root, links, joints, children };
+  const root = payload.rootFrame || [...links].find((link) => !childLinks.has(link)) || "base_link";
+  const movingJoints = joints.filter((joint) => joint.type !== "fixed");
+  return {
+    path: payload.path,
+    source: payload.source,
+    model: payload.model,
+    root,
+    links,
+    joints,
+    movingJoints,
+    children,
+  };
 }
 
 function renderTopicMap() {
   const robot = state.config.robots[state.robotId];
   const map = $("#topic-map");
-  map.innerHTML = Object.entries(robot.topics)
+  const urdf = robot.urdf || {};
+  const metaRows = [
+    ["model", robot.model || robot.label],
+    ["repo", robot.repo || urdf.source],
+    ["urdf", urdf.path],
+    ["root", urdf.rootFrame],
+  ];
+  const metadata = metaRows
+    .filter(([, value]) => value)
+    .map(
+      ([key, value]) => `
+        <div class="topic-row robot-meta-row">
+          <b>${escapeHtml(key)}</b>
+          <code>${escapeHtml(value)}</code>
+        </div>
+      `,
+    )
+    .join("");
+  const topics = Object.entries(robot.topics)
     .map(
       ([key, topic]) => `
         <div class="topic-row">
@@ -155,6 +194,7 @@ function renderTopicMap() {
       `,
     )
     .join("");
+  map.innerHTML = metadata + topics;
 }
 
 function renderCameraGrid() {
@@ -417,6 +457,42 @@ function matAxis(axis, angle) {
   ];
 }
 
+function matQuat([x, y, z, w]) {
+  const len = Math.hypot(x, y, z, w) || 1;
+  x /= len;
+  y /= len;
+  z /= len;
+  w /= len;
+  const xx = x * x, yy = y * y, zz = z * z;
+  const xy = x * y, xz = x * z, yz = y * z;
+  const wx = w * x, wy = w * y, wz = w * z;
+  return [
+    1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy), 0,
+    2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx), 0,
+    2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy), 0,
+    0, 0, 0, 1,
+  ];
+}
+
+function normalizeFrameId(frameId) {
+  return String(frameId || "").replace(/^\/+/, "");
+}
+
+function tfByChild() {
+  const map = new Map();
+  const transforms = state.robotState?.transforms || [];
+  transforms.forEach((transform) => {
+    const child = normalizeFrameId(transform.child);
+    const parent = normalizeFrameId(transform.parent);
+    if (!child || !parent) return;
+    map.set(child, {
+      parent,
+      local: matMul(matTranslate(transform.translation || [0, 0, 0]), matQuat(transform.rotation || [0, 0, 0, 1])),
+    });
+  });
+  return map;
+}
+
 function transformPoint(m, [x, y, z]) {
   return [
     m[0] * x + m[1] * y + m[2] * z + m[3],
@@ -425,26 +501,29 @@ function transformPoint(m, [x, y, z]) {
   ];
 }
 
-function buildUrdfFrames(t) {
+function buildUrdfFrames() {
   if (!state.urdf) return null;
   const frames = new Map([[state.urdf.root, matIdentity()]]);
   const edges = [];
   const jointsByName = state.robotState?.joints || {};
-  const source = state.robotState?.source || "demo";
+  const transforms = tfByChild();
   const visit = (link) => {
     const parentMat = frames.get(link);
     const childJoints = state.urdf.children.get(link) || [];
     childJoints.forEach((joint) => {
       let angle = Number(jointsByName[joint.name] || 0);
       if (!Number.isFinite(angle)) angle = 0;
-      if ((source === "waiting" || source === "unavailable" || source === "not-started") && joint.type !== "fixed") {
-        angle = Math.sin(t * 1.7 + joint.index * 0.63) * 0.22;
-      }
-      let local = matMul(matTranslate(joint.xyz), matRpy(joint.rpy));
-      if (joint.type === "revolute" || joint.type === "continuous") {
-        local = matMul(local, matAxis(joint.axis, angle));
-      } else if (joint.type === "prismatic") {
-        local = matMul(local, matTranslate(joint.axis.map((axis) => axis * angle)));
+      const tf = transforms.get(normalizeFrameId(joint.child));
+      let local;
+      if (tf && tf.parent === normalizeFrameId(link)) {
+        local = tf.local;
+      } else {
+        local = matMul(matTranslate(joint.xyz), matRpy(joint.rpy));
+        if (joint.type === "revolute" || joint.type === "continuous") {
+          local = matMul(local, matAxis(joint.axis, angle));
+        } else if (joint.type === "prismatic") {
+          local = matMul(local, matTranslate(joint.axis.map((axis) => axis * angle)));
+        }
       }
       const childMat = matMul(parentMat, local);
       frames.set(joint.child, childMat);
@@ -453,7 +532,14 @@ function buildUrdfFrames(t) {
     });
   };
   visit(state.urdf.root);
-  return { frames, edges };
+  const points = edges.flatMap((edge) => [edge.parent, edge.child]);
+  const bbox = points.length
+    ? {
+        min: points[0].map((_, axis) => Math.min(...points.map((point) => point[axis]))),
+        max: points[0].map((_, axis) => Math.max(...points.map((point) => point[axis]))),
+      }
+    : { min: [0, 0, 0], max: [0, 0, 1] };
+  return { frames, edges, bbox };
 }
 
 function drawLine(ctx, a, b, color, width = 2) {
@@ -492,7 +578,7 @@ function drawScene(now = 0) {
 }
 
 function drawSceneInner(ctx, width, height, t) {
-  const yaw = Math.sin(t * 0.35) * 0.55;
+  const yaw = Math.sin(t * 0.18) * 0.28;
   const gridY = height * 0.72;
 
   ctx.strokeStyle = "rgba(97, 213, 255, 0.12)";
@@ -508,19 +594,30 @@ function drawSceneInner(ctx, width, height, t) {
     drawLine(ctx, a, b, "rgba(97, 213, 255, 0.10)", 1);
   }
 
-  const urdfFrames = buildUrdfFrames(t);
+  const urdfFrames = buildUrdfFrames();
   if (urdfFrames && urdfFrames.edges.length) {
+    const min = urdfFrames.bbox.min;
+    const max = urdfFrames.bbox.max;
+    const size = max.map((value, axis) => Math.max(value - min[axis], 0.001));
+    const center = max.map((value, axis) => (value + min[axis]) / 2);
+    const scale = Math.min(3.6 / Math.max(size[1], 0.55), 3.4 / Math.max(size[2], 0.9), 3.2);
+    const mapPoint = (point) => [
+      (point[1] - center[1]) * scale,
+      (point[2] - min[2]) * scale - 1.05,
+      (point[0] - center[0]) * scale + 2.9,
+    ];
     urdfFrames.edges.forEach((edge) => {
-      const parent = project([edge.parent[0], edge.parent[2], edge.parent[1] + 2.2], width, height, yaw);
-      const child = project([edge.child[0], edge.child[2], edge.child[1] + 2.2], width, height, yaw);
+      const parent = project(mapPoint(edge.parent), width, height, yaw);
+      const child = project(mapPoint(edge.child), width, height, yaw);
       const moving = edge.joint.type !== "fixed";
       drawLine(ctx, parent, child, moving ? "#d8f4ff" : "rgba(134, 168, 255, 0.55)", moving ? 3.5 : 1.5);
       drawDot(ctx, child, moving ? 4 : 2.4, moving ? "#5ee493" : "#86a8ff");
     });
-    const rootPoint = project([0, 0, 2.2], width, height, yaw);
+    const rootMat = urdfFrames.frames.get(state.urdf.root) || matIdentity();
+    const rootPoint = project(mapPoint(transformPoint(rootMat, [0, 0, 0])), width, height, yaw);
     drawDot(ctx, rootPoint, 7, "#61d5ff");
   } else {
-    const body = project([0, 0.42 + Math.sin(t * 3.2) * 0.025, 2.4], width, height, yaw);
+    const body = project([0, 0.42, 2.4], width, height, yaw);
     const head = project([0, 1.02, 2.38], width, height, yaw);
     const rear = project([0, 0.36, 2.95], width, height, yaw);
     const front = project([0, 0.42, 1.86], width, height, yaw);
@@ -530,32 +627,22 @@ function drawSceneInner(ctx, width, height, t) {
     drawDot(ctx, body, 7, "#5ee493");
   }
 
-  const cam = project([0, 0.82, 1.76], width, height, yaw);
-  const frustum = [
-    project([-1.55, -0.35, 4.4], width, height, yaw),
-    project([1.55, -0.35, 4.4], width, height, yaw),
-    project([1.15, 1.05, 4.4], width, height, yaw),
-    project([-1.15, 1.05, 4.4], width, height, yaw),
-  ];
-  frustum.forEach((p) => drawLine(ctx, cam, p, "rgba(94, 228, 147, 0.52)", 1.5));
-  for (let i = 0; i < frustum.length; i++) {
-    drawLine(ctx, frustum[i], frustum[(i + 1) % frustum.length], "rgba(94, 228, 147, 0.62)", 1.5);
-  }
-
-  for (let i = 0; i < 70; i++) {
-    const x = Math.sin(i * 12.989 + t * 0.2) * 1.5;
-    const y = -0.75 + ((i * 37) % 100) / 260;
-    const z = 3.5 + ((i * 19) % 90) / 28;
-    const p = project([x, y, z], width, height, yaw);
-    drawDot(ctx, p, Math.max(1.1, 2.8 * p[2] * 0.014), `rgba(255, 191, 94, ${0.25 + (i % 5) * 0.09})`);
-  }
-
   const labelY = Math.max(28, gridY - 260);
   ctx.fillStyle = "rgba(237, 244, 247, 0.92)";
   ctx.font = "12px ui-sans-serif, system-ui";
-  ctx.fillText(state.urdf ? `${state.config.robots[state.robotId].label} URDF kinematic tree` : "Unitree adapter preview", 16, labelY);
+  ctx.fillText(
+    state.urdf ? `${state.urdf.model || state.config.robots[state.robotId].label} URDF tree from ${state.urdf.source}` : "Unitree URDF unavailable",
+    16,
+    labelY,
+  );
   ctx.fillStyle = "rgba(140, 153, 167, 0.95)";
-  ctx.fillText("Live JointState/TF data is applied when visible inside the FMS container", 16, labelY + 20);
+  const sourceLabel =
+    state.robotState?.source === "live"
+      ? "Live /joint_states applied"
+      : state.robotState?.source === "tf"
+        ? "Live /tf transforms applied"
+        : "Zero pose; waiting for live /joint_states or /tf";
+  ctx.fillText(sourceLabel, 16, labelY + 20);
 }
 
 setupInteractions();

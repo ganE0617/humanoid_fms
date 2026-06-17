@@ -140,10 +140,14 @@ def process_users(device: str) -> list[dict[str, str]]:
             continue
         parts = line.split()
         if len(parts) >= 3 and parts[0].isdigit():
+            if int(parts[0]) == os.getpid():
+                continue
             users.append({"pid": parts[0], "user": parts[1], "access": parts[2], "command": " ".join(parts[3:])})
     lsof = sh(f"lsof {device} 2>/dev/null || true", timeout=2)
     for line in lsof.stdout.splitlines()[1:]:
         parts = line.split()
+        if len(parts) >= 2 and parts[1].isdigit() and int(parts[1]) == os.getpid():
+            continue
         if len(parts) >= 2 and not any(item.get("pid") == parts[1] for item in users):
             users.append({"pid": parts[1], "user": parts[2] if len(parts) > 2 else "", "access": "", "command": parts[0]})
     return users
@@ -433,12 +437,16 @@ def get_robot_urdf(robot_id: str) -> JSONResponse:
             status_code=404,
             detail=f"URDF missing: {urdf_path}. Run ./scripts/sync_robot_descriptions.sh",
         )
+    xml = path.read_text(encoding="utf-8", errors="replace")
     return JSONResponse(
         {
             "robotId": robot_id,
+            "label": robot.get("label", robot_id),
+            "model": robot.get("model", robot.get("label", robot_id)),
+            "source": robot.get("urdf", {}).get("source", robot.get("repo", "")),
             "path": urdf_path,
             "rootFrame": robot.get("urdf", {}).get("rootFrame", ""),
-            "xml": path.read_text(encoding="utf-8", errors="replace"),
+            "xml": xml,
         }
     )
 

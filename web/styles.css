@@ -234,6 +234,12 @@ select {
   white-space: nowrap;
 }
 
+.robot-meta-row code {
+  line-height: 1.35;
+  white-space: normal;
+  word-break: break-word;
+}
+
 .arm-button {
   width: calc(100% - 24px);
   height: 44px;
