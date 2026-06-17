@@ -20,6 +20,7 @@ const state = {
     root: null,
     depthGroup: null,
     depthPoints: null,
+    depthSurface: null,
     depthFrustum: null,
     controls: {
       target: new THREE.Vector3(0, 0.45, 0),
@@ -32,6 +33,8 @@ const state = {
       mode: "rotate",
       lastX: 0,
       lastY: 0,
+      userInteracted: false,
+      depthFitDone: false,
     },
     links: new Map(),
     stlLoader: new STLLoader(),
@@ -98,7 +101,7 @@ async function boot() {
   setupInteractions();
   setInterval(refreshStatus, 2500);
   setInterval(refreshRobotState, 80);
-  setInterval(refreshDepthState, 180);
+  setInterval(refreshDepthState, 500);
   setInterval(refreshMissionState, 1000);
   setInterval(updateClock, 500);
   requestAnimationFrame(renderScene);
@@ -776,19 +779,36 @@ function initMeshViewer() {
 
   const depthGroup = new THREE.Group();
   depthGroup.matrixAutoUpdate = false;
-  const pointGeometry = new THREE.BufferGeometry();
-  const pointMaterial = new THREE.PointsMaterial({
-    size: 0.018,
+  const surfaceGeometry = new THREE.BufferGeometry();
+  const surfaceMaterial = new THREE.MeshBasicMaterial({
     vertexColors: true,
     transparent: true,
-    opacity: 0.92,
+    opacity: 0.72,
+    side: THREE.DoubleSide,
+    depthTest: false,
+    depthWrite: false,
+  });
+  const depthSurface = new THREE.Mesh(surfaceGeometry, surfaceMaterial);
+  depthSurface.frustumCulled = false;
+  depthSurface.renderOrder = 2;
+  depthGroup.add(depthSurface);
+  const pointGeometry = new THREE.BufferGeometry();
+  const pointMaterial = new THREE.PointsMaterial({
+    size: 0.055,
+    map: makeDepthPointTexture(),
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.82,
+    alphaTest: 0.05,
+    depthTest: false,
     depthWrite: false,
   });
   const depthPoints = new THREE.Points(pointGeometry, pointMaterial);
   depthPoints.frustumCulled = false;
+  depthPoints.renderOrder = 3;
   depthGroup.add(depthPoints);
   const frustumGeometry = new THREE.BufferGeometry();
-  const frustumMaterial = new THREE.LineBasicMaterial({ color: 0x5ee493, transparent: true, opacity: 0.72 });
+  const frustumMaterial = new THREE.LineBasicMaterial({ color: 0x5ee493, transparent: true, opacity: 0.82, depthTest: false });
   const depthFrustum = new THREE.LineSegments(frustumGeometry, frustumMaterial);
   depthFrustum.frustumCulled = false;
   depthGroup.add(depthFrustum);
@@ -800,11 +820,28 @@ function initMeshViewer() {
   state.mesh.root = root;
   state.mesh.depthGroup = depthGroup;
   state.mesh.depthPoints = depthPoints;
+  state.mesh.depthSurface = depthSurface;
   state.mesh.depthFrustum = depthFrustum;
   updateOrbitCamera();
   bindSceneControls(canvas);
   resizeRenderer();
   window.addEventListener("resize", resizeRenderer);
+}
+
+function makeDepthPointTexture() {
+  const canvas = document.createElement("canvas");
+  canvas.width = 64;
+  canvas.height = 64;
+  const ctx = canvas.getContext("2d");
+  const gradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gradient.addColorStop(0, "rgba(255,255,255,1)");
+  gradient.addColorStop(0.55, "rgba(255,255,255,0.9)");
+  gradient.addColorStop(1, "rgba(255,255,255,0)");
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, 64, 64);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.needsUpdate = true;
+  return texture;
 }
 
 function clamp(value, min, max) {
@@ -858,12 +895,14 @@ function bindSceneControls(canvas) {
     "wheel",
     (event) => {
       event.preventDefault();
+      state.mesh.controls.userInteracted = true;
       zoomOrbit(event.deltaY);
     },
     { passive: false },
   );
   canvas.addEventListener("pointerdown", (event) => {
     const controls = state.mesh.controls;
+    controls.userInteracted = true;
     controls.pointerId = event.pointerId;
     controls.mode = event.button === 2 || event.shiftKey ? "pan" : "rotate";
     controls.lastX = event.clientX;
@@ -897,7 +936,10 @@ function bindSceneControls(canvas) {
       }
     });
   });
-  canvas.addEventListener("dblclick", fitCameraToRobot);
+  canvas.addEventListener("dblclick", () => {
+    state.mesh.controls.userInteracted = true;
+    fitCameraToRobot();
+  });
 }
 
 function matrixFromUrdf(values) {
@@ -1010,8 +1052,8 @@ function depthColor(depth, near, far) {
 }
 
 function updateDepthGeometry() {
-  const { depthPoints, depthFrustum } = state.mesh;
-  if (!depthPoints || !depthFrustum) return;
+  const { depthPoints, depthSurface, depthFrustum } = state.mesh;
+  if (!depthPoints || !depthSurface || !depthFrustum) return;
   const depth = state.depthState || {};
   const config = depth.config || state.config?.robots?.[state.robotId]?.depthSensor || {};
   const near = Number(config.nearMeters || 0.18);
@@ -1038,6 +1080,72 @@ function updateDepthGeometry() {
   ].flat();
   depthFrustum.geometry.setAttribute("position", new THREE.Float32BufferAttribute(lines, 3));
   depthFrustum.geometry.computeBoundingSphere();
+
+  const surface = depth.surface || {};
+  const surfacePoints = Array.isArray(surface.points) ? surface.points : [];
+  const surfaceWidth = Number(surface.width || 0);
+  const surfaceHeight = Number(surface.height || 0);
+  const maxDepthDelta = Number(surface.maxDepthDelta || config.surfaceMaxDepthDelta || 0.18);
+  const vertexIndex = new Int32Array(surfacePoints.length).fill(-1);
+  const surfacePositions = [];
+  const surfaceColors = [];
+  surfacePoints.forEach((point, index) => {
+    if (!Array.isArray(point)) return;
+    const px = Number(point[0]);
+    const py = Number(point[1]);
+    const pz = Number(point[2]);
+    if (![px, py, pz].every(Number.isFinite)) return;
+    vertexIndex[index] = surfacePositions.length / 3;
+    surfacePositions.push(px, py, pz);
+    const color = depthColor(Math.hypot(px, py, pz), near, far);
+    surfaceColors.push(color[0], color[1], color[2]);
+  });
+  const indices = [];
+  const addTriangle = (a, b, c) => {
+    const ia = vertexIndex[a];
+    const ib = vertexIndex[b];
+    const ic = vertexIndex[c];
+    if (ia < 0 || ib < 0 || ic < 0) return;
+    const za = surfacePoints[a][2];
+    const zb = surfacePoints[b][2];
+    const zc = surfacePoints[c][2];
+    if (Math.max(za, zb, zc) - Math.min(za, zb, zc) > maxDepthDelta) return;
+    indices.push(ia, ib, ic);
+  };
+  if (surfaceWidth > 1 && surfaceHeight > 1) {
+    for (let row = 0; row < surfaceHeight - 1; row += 1) {
+      for (let col = 0; col < surfaceWidth - 1; col += 1) {
+        const a = row * surfaceWidth + col;
+        const b = a + 1;
+        const c = a + surfaceWidth;
+        const d = c + 1;
+        addTriangle(a, c, b);
+        addTriangle(b, c, d);
+      }
+    }
+  }
+  depthSurface.geometry.setIndex(indices);
+  depthSurface.geometry.setAttribute("position", new THREE.Float32BufferAttribute(surfacePositions, 3));
+  depthSurface.geometry.setAttribute("color", new THREE.Float32BufferAttribute(surfaceColors, 3));
+  depthSurface.geometry.computeBoundingSphere();
+  if (
+    surfacePositions.length &&
+    state.urdf &&
+    state.mesh.links.size &&
+    !state.mesh.controls.depthFitDone &&
+    !state.mesh.controls.userInteracted
+  ) {
+    state.mesh.controls.depthFitDone = true;
+    requestAnimationFrame(() => {
+      updateDepthPose();
+      if (state.mesh.depthGroup?.visible) {
+        state.mesh.root?.updateMatrixWorld(true);
+        fitCameraToRobot();
+      } else {
+        state.mesh.controls.depthFitDone = false;
+      }
+    });
+  }
 
   const points = Array.isArray(depth.points) ? depth.points : [];
   const positions = new Float32Array(points.length * 3);
@@ -1147,11 +1255,37 @@ function groundRobotOnGrid() {
 }
 
 function fitCameraToRobot() {
-  const { root, camera, scene } = state.mesh;
+  const { root, camera, scene, depthGroup, depthSurface, depthFrustum, links } = state.mesh;
   if (!root || !camera || !scene) return;
   root.updateMatrixWorld(true);
-  const box = new THREE.Box3().setFromObject(root);
-  if (!Number.isFinite(box.min.x) || box.isEmpty()) return;
+  const box = new THREE.Box3();
+  let hasBounds = false;
+  links.forEach((group) => {
+    group.updateMatrixWorld(true);
+    const linkBox = new THREE.Box3().setFromObject(group);
+    if (!Number.isFinite(linkBox.min.x) || linkBox.isEmpty()) return;
+    box.union(linkBox);
+    hasBounds = true;
+  });
+  if (depthGroup?.visible) {
+    if (depthSurface?.geometry?.attributes?.position?.count) {
+      depthSurface.updateMatrixWorld(true);
+      const depthBox = new THREE.Box3().setFromObject(depthSurface);
+      if (Number.isFinite(depthBox.min.x) && !depthBox.isEmpty()) {
+        box.union(depthBox);
+        hasBounds = true;
+      }
+    }
+    if (depthFrustum?.geometry?.attributes?.position?.count) {
+      depthFrustum.updateMatrixWorld(true);
+      const frustumBox = new THREE.Box3().setFromObject(depthFrustum);
+      if (Number.isFinite(frustumBox.min.x) && !frustumBox.isEmpty()) {
+        box.union(frustumBox);
+        hasBounds = true;
+      }
+    }
+  }
+  if (!hasBounds || !Number.isFinite(box.min.x) || box.isEmpty()) return;
 
   const center = new THREE.Vector3();
   const size = new THREE.Vector3();

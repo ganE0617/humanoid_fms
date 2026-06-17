@@ -291,9 +291,9 @@ done
     return access
 
 
-def depth_points_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[list[list[float]], float]:
+def depth_points_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[list[list[float]], float, dict[str, Any]]:
     height, width = frame.shape[:2]
-    max_points = max(100, min(12000, int(config.get("maxPoints", 2400))))
+    max_points = max(100, min(20000, int(config.get("maxPoints", 8000))))
     scale = float(config.get("depthScaleMeters", 0.001))
     near = float(config.get("nearMeters", 0.18))
     far = float(config.get("farMeters", 3.0))
@@ -303,26 +303,52 @@ def depth_points_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[li
     fy = height / (2.0 * np.tan(vfov / 2.0))
     cx = (width - 1) / 2.0
     cy = (height - 1) / 2.0
-    stride = max(2, int((width * height / max_points) ** 0.5))
-    points: list[list[float]] = []
-    nearest = 0.0
-    for v in range(0, height, stride):
-        row = frame[v]
-        for u in range(0, width, stride):
-            raw = int(row[u])
-            if raw <= 0 or raw >= 65535:
+
+    depth_m = frame.astype(np.float32) * scale
+    valid = (frame > 0) & (frame < 65535) & (depth_m >= near) & (depth_m <= far)
+    vs, us = np.nonzero(valid)
+    count = int(vs.size)
+    if count > max_points:
+        keep = np.linspace(0, count - 1, max_points, dtype=np.int64)
+        vs = vs[keep]
+        us = us[keep]
+
+    z = depth_m[vs, us].astype(np.float32) if vs.size else np.array([], dtype=np.float32)
+    x = ((us.astype(np.float32) - cx) * z / fx) if vs.size else z
+    y = ((vs.astype(np.float32) - cy) * z / fy) if vs.size else z
+    distances = np.sqrt(x * x + y * y + z * z) if vs.size else np.array([], dtype=np.float32)
+    nearest = float(np.min(distances)) if distances.size else 0.0
+    points = np.column_stack((x, y, z)).round(4).astype(float).tolist() if vs.size else []
+
+    step = max(4, min(32, int(config.get("surfaceStep", 8))))
+    rows = int(np.ceil(height / step))
+    cols = int(np.ceil(width / step))
+    surface_points: list[list[float] | None] = []
+    for row in range(rows):
+        v0 = row * step
+        v1 = min(height, v0 + step)
+        for col in range(cols):
+            u0 = col * step
+            u1 = min(width, u0 + step)
+            patch_depth = depth_m[v0:v1, u0:u1]
+            patch_valid = valid[v0:v1, u0:u1]
+            if not np.any(patch_valid):
+                surface_points.append(None)
                 continue
-            z = raw * scale
-            if z < near or z > far:
-                continue
-            x = (u - cx) * z / fx
-            y = (v - cy) * z / fy
-            distance = float((x * x + y * y + z * z) ** 0.5)
-            nearest = distance if nearest <= 0.0 else min(nearest, distance)
-            points.append([round(float(x), 4), round(float(y), 4), round(float(z), 4)])
-            if len(points) >= max_points:
-                return points, nearest
-    return points, nearest
+            zc = float(np.median(patch_depth[patch_valid]))
+            uc = u0 + (u1 - u0 - 1) * 0.5
+            vc = v0 + (v1 - v0 - 1) * 0.5
+            xc = (uc - cx) * zc / fx
+            yc = (vc - cy) * zc / fy
+            surface_points.append([round(float(xc), 4), round(float(yc), 4), round(float(zc), 4)])
+
+    surface = {
+        "width": cols,
+        "height": rows,
+        "points": surface_points,
+        "maxDepthDelta": float(config.get("surfaceMaxDepthDelta", 0.18)),
+    }
+    return points, nearest, surface
 
 
 class RosMonitor:
@@ -338,6 +364,7 @@ class RosMonitor:
         self.transforms: list[dict[str, Any]] = []
         self.depth_frame = ""
         self.depth_points: list[list[float]] = []
+        self.depth_surface: dict[str, Any] = {}
         self.depth_error = ""
         self.depth_total = 0
         self.depth_nearest = 0.0
@@ -376,6 +403,7 @@ class RosMonitor:
                 "frameId": self.depth_frame or depth.get("fallbackOpticalFrame", ""),
                 "lastDepthTime": self.last_depth_time,
                 "points": self.depth_points,
+                "surface": self.depth_surface,
                 "total": self.depth_total,
                 "nearestMeters": self.depth_nearest,
                 "dataSource": self.depth_source,
@@ -451,9 +479,10 @@ class RosMonitor:
                     time.sleep(1.0)
                     continue
 
-                points, nearest = depth_points_from_z16(frame, depth)
+                points, nearest, surface = depth_points_from_z16(frame, depth)
                 with self.lock:
                     self.depth_points = points
+                    self.depth_surface = surface
                     self.depth_frame = depth.get("fallbackOpticalFrame", "camera_depth_optical_frame")
                     self.last_depth_time = time.time()
                     self.depth_total = int(frame.size)
@@ -631,6 +660,7 @@ class RosMonitor:
                                 break
                         with self.lock:
                             self.depth_points = points
+                            self.depth_surface = {}
                             self.depth_frame = msg.header.frame_id
                             self.last_depth_time = now
                             self.depth_total = total

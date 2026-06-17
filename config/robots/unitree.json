@@ -43,7 +43,9 @@
     "verticalFovDeg": 58,
     "nearMeters": 0.18,
     "farMeters": 3.0,
-    "maxPoints": 2400
+    "maxPoints": 6000,
+    "surfaceStep": 6,
+    "surfaceMaxDepthDelta": 0.45
   },
   "lowStateJointNames": [
     "FL_hip_joint",
