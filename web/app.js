@@ -696,7 +696,18 @@ async function objectForMeshUrl(url, linkName) {
     if (lower.endsWith(".dae")) {
       state.mesh.assetCache.set(
         url,
-        state.mesh.colladaLoader.loadAsync(url).then((collada) => collada.scene),
+        state.mesh.colladaLoader.loadAsync(url).then((collada) => {
+          const scene = collada.scene;
+          if (
+            Math.abs(scene.rotation.x + Math.PI / 2) < 0.000001 &&
+            Math.abs(scene.rotation.y) < 0.000001 &&
+            Math.abs(scene.rotation.z) < 0.000001
+          ) {
+            scene.rotation.set(0, 0, 0);
+            scene.updateMatrix();
+          }
+          return scene;
+        }),
       );
     } else if (lower.endsWith(".stl")) {
       state.mesh.assetCache.set(
@@ -772,6 +783,18 @@ function updateRobotMeshTransforms() {
     group.matrix.copy(matrixFromUrdf(matrix));
     group.matrixWorldNeedsUpdate = true;
   });
+  groundRobotOnGrid();
+}
+
+function groundRobotOnGrid() {
+  const { root } = state.mesh;
+  if (!root) return;
+  root.position.y = 0;
+  root.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(root);
+  if (!Number.isFinite(box.min.y) || box.isEmpty()) return;
+  root.position.y = Math.max(0, -box.min.y + 0.015);
+  root.updateMatrixWorld(true);
 }
 
 function fitCameraToRobot() {
