@@ -1,3 +1,6 @@
+import * as THREE from "three";
+import { STLLoader } from "/lib/STLLoader.js";
+
 const state = {
   config: null,
   status: null,
@@ -7,6 +10,16 @@ const state = {
   lastStatusAt: 0,
   urdf: null,
   robotState: null,
+  mesh: {
+    renderer: null,
+    scene: null,
+    camera: null,
+    root: null,
+    links: new Map(),
+    loader: new STLLoader(),
+    geometryCache: new Map(),
+    loadToken: 0,
+  },
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -20,12 +33,6 @@ function setText(selector, value) {
   if (node) node.textContent = value;
 }
 
-function statusClass(cam) {
-  if (!cam.exists) return "bad";
-  if (cam.busy) return "warn";
-  return "good";
-}
-
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -34,24 +41,33 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
-async function fetchJson(path) {
-  const response = await fetch(path, { cache: "no-store" });
-  if (!response.ok) throw new Error(`${path} ${response.status}`);
-  return response.json();
+function fetchJson(path) {
+  return fetch(path, { cache: "no-store" }).then((response) => {
+    if (!response.ok) throw new Error(`${path} ${response.status}`);
+    return response.json();
+  });
+}
+
+function statusClass(cam) {
+  if (!cam.exists) return "bad";
+  if (cam.busy) return "warn";
+  return "good";
 }
 
 async function boot() {
   state.config = await fetchJson("/api/config");
+  initMeshViewer();
   renderRobotSelect();
   renderTopicMap();
   renderCameraGrid();
   await loadUrdf();
   await refreshStatus();
   await refreshRobotState();
+  setupInteractions();
   setInterval(refreshStatus, 2500);
   setInterval(refreshRobotState, 80);
   setInterval(updateClock, 500);
-  requestAnimationFrame(drawScene);
+  requestAnimationFrame(renderScene);
 }
 
 function updateClock() {
@@ -82,15 +98,19 @@ async function loadUrdf() {
   try {
     const payload = await fetchJson(`/api/robots/${state.robotId}/urdf`);
     state.urdf = parseUrdf(payload);
-    setText("#scene-root", `${state.urdf.model || state.config.robots[state.robotId].label} / ${state.urdf.root || payload.rootFrame || "root"}`);
+    setText("#scene-root", `${state.urdf.model || state.config.robots[state.robotId].label} / ${state.urdf.root}`);
     setText("#scene-joints", `${state.urdf.movingJoints.length}/${state.urdf.joints.length} moving joints`);
     setText("#scene-links", `${state.urdf.links.size} links`);
+    setText("#scene-meshes", "loading meshes");
+    await loadRobotMeshes();
   } catch (error) {
     state.urdf = null;
+    clearRobotMeshes();
     setText("#scene-root", "URDF missing");
     setText("#scene-source", "run sync script");
     setText("#scene-joints", "0 joints");
     setText("#scene-links", "0 links");
+    setText("#scene-meshes", "0 meshes");
     console.error(error);
   }
 }
@@ -124,9 +144,37 @@ function parseVector(value, fallback = [0, 0, 0]) {
   return parts.length >= 3 && parts.every(Number.isFinite) ? parts.slice(0, 3) : fallback;
 }
 
+function directChildren(element, tagName) {
+  return [...element.children].filter((child) => child.tagName === tagName);
+}
+
+function parseVisuals(linkElement) {
+  return directChildren(linkElement, "visual")
+    .map((visual, index) => {
+      const origin = visual.querySelector("origin");
+      const mesh = visual.querySelector("geometry mesh");
+      if (!mesh) return null;
+      return {
+        index,
+        xyz: parseVector(origin?.getAttribute("xyz"), [0, 0, 0]),
+        rpy: parseVector(origin?.getAttribute("rpy"), [0, 0, 0]),
+        filename: mesh.getAttribute("filename") || "",
+        scale: parseVector(mesh.getAttribute("scale"), [1, 1, 1]),
+      };
+    })
+    .filter((visual) => visual?.filename);
+}
+
 function parseUrdf(payload) {
   const doc = new DOMParser().parseFromString(payload.xml, "application/xml");
-  const links = new Set([...doc.querySelectorAll("link")].map((link) => link.getAttribute("name")).filter(Boolean));
+  const linkVisuals = new Map();
+  const links = new Set();
+  [...doc.querySelectorAll("link")].forEach((link) => {
+    const name = link.getAttribute("name");
+    if (!name) return;
+    links.add(name);
+    linkVisuals.set(name, parseVisuals(link));
+  });
   const joints = [...doc.querySelectorAll("joint")]
     .map((joint, index) => {
       const origin = joint.querySelector("origin");
@@ -151,6 +199,7 @@ function parseUrdf(payload) {
   });
   const root = payload.rootFrame || [...links].find((link) => !childLinks.has(link)) || "base_link";
   const movingJoints = joints.filter((joint) => joint.type !== "fixed");
+  const meshCount = [...linkVisuals.values()].reduce((total, visuals) => total + visuals.length, 0);
   return {
     path: payload.path,
     source: payload.source,
@@ -160,6 +209,8 @@ function parseUrdf(payload) {
     joints,
     movingJoints,
     children,
+    linkVisuals,
+    meshCount,
   };
 }
 
@@ -287,7 +338,7 @@ function renderRosStatus() {
   $("#tab-ros").innerHTML =
     `<div class="status-row"><b>${ros.count} topics detected</b><code>ros2 topic list -t</code></div>` +
     ros.topics
-      .slice(0, 42)
+      .slice(0, 38)
       .map(
         (topic) => `
           <div class="status-row">
@@ -344,6 +395,17 @@ function renderDockerStatus() {
 function setupInteractions() {
   $("#refresh-btn").addEventListener("click", refreshStatus);
 
+  document.querySelectorAll("[data-toggle-panel]").forEach((button) => {
+    const panel = button.dataset.togglePanel;
+    button.classList.toggle("active", !document.body.classList.contains(`${panel}-collapsed`));
+    button.addEventListener("click", () => {
+      const collapsedClass = `${panel}-collapsed`;
+      document.body.classList.toggle(collapsedClass);
+      button.classList.toggle("active", !document.body.classList.contains(collapsedClass));
+      resizeRenderer();
+    });
+  });
+
   document.querySelectorAll(".tab").forEach((button) => {
     button.addEventListener("click", () => {
       document.querySelectorAll(".tab").forEach((tab) => tab.classList.remove("active"));
@@ -394,17 +456,6 @@ function setupInteractions() {
 function updateDriveMeters() {
   setText("#linear-meter", state.drive.linear.toFixed(2));
   setText("#angular-meter", state.drive.angular.toFixed(2));
-}
-
-function project(point, width, height, yaw) {
-  const [x0, y0, z0] = point;
-  const cy = Math.cos(yaw);
-  const sy = Math.sin(yaw);
-  const x = x0 * cy - z0 * sy;
-  const z = x0 * sy + z0 * cy;
-  const y = y0;
-  const scale = 420 / (z + 8);
-  return [width * 0.5 + x * scale, height * 0.55 - y * scale, scale];
 }
 
 function matIdentity() {
@@ -532,120 +583,183 @@ function buildUrdfFrames() {
     });
   };
   visit(state.urdf.root);
-  const points = edges.flatMap((edge) => [edge.parent, edge.child]);
-  const bbox = points.length
-    ? {
-        min: points[0].map((_, axis) => Math.min(...points.map((point) => point[axis]))),
-        max: points[0].map((_, axis) => Math.max(...points.map((point) => point[axis]))),
-      }
-    : { min: [0, 0, 0], max: [0, 0, 1] };
-  return { frames, edges, bbox };
+  return { frames, edges };
 }
 
-function drawLine(ctx, a, b, color, width = 2) {
-  ctx.strokeStyle = color;
-  ctx.lineWidth = width;
-  ctx.beginPath();
-  ctx.moveTo(a[0], a[1]);
-  ctx.lineTo(b[0], b[1]);
-  ctx.stroke();
-}
-
-function drawDot(ctx, p, radius, color) {
-  ctx.fillStyle = color;
-  ctx.beginPath();
-  ctx.arc(p[0], p[1], radius, 0, Math.PI * 2);
-  ctx.fill();
-}
-
-function drawScene(now = 0) {
+function initMeshViewer() {
   const canvas = $("#scene-canvas");
-  const rect = canvas.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
-  const width = Math.max(1, Math.floor(rect.width * dpr));
-  const height = Math.max(1, Math.floor(rect.height * dpr));
-  if (canvas.width !== width || canvas.height !== height) {
-    canvas.width = width;
-    canvas.height = height;
-  }
-  const ctx = canvas.getContext("2d");
-  ctx.clearRect(0, 0, width, height);
-  ctx.save();
-  ctx.scale(dpr, dpr);
-  drawSceneInner(ctx, rect.width, rect.height, now / 1000);
-  ctx.restore();
-  requestAnimationFrame(drawScene);
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+  renderer.setClearColor(0x081018, 1);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+  const scene = new THREE.Scene();
+  scene.fog = new THREE.Fog(0x081018, 4, 9);
+
+  const camera = new THREE.PerspectiveCamera(42, 1, 0.01, 50);
+  camera.position.set(2.8, 1.45, 3.4);
+  camera.lookAt(0, 0.65, 0);
+
+  const hemi = new THREE.HemisphereLight(0xd8f4ff, 0x0b1218, 2.2);
+  scene.add(hemi);
+  const key = new THREE.DirectionalLight(0xffffff, 2.6);
+  key.position.set(3, 4, 2);
+  scene.add(key);
+  const rim = new THREE.DirectionalLight(0x61d5ff, 1.2);
+  rim.position.set(-2, 2.2, -2);
+  scene.add(rim);
+
+  const grid = new THREE.GridHelper(4.8, 24, 0x22445a, 0x132837);
+  grid.position.y = -0.005;
+  scene.add(grid);
+
+  const root = new THREE.Group();
+  root.rotation.x = -Math.PI / 2;
+  scene.add(root);
+
+  state.mesh.renderer = renderer;
+  state.mesh.scene = scene;
+  state.mesh.camera = camera;
+  state.mesh.root = root;
+  resizeRenderer();
+  window.addEventListener("resize", resizeRenderer);
 }
 
-function drawSceneInner(ctx, width, height, t) {
-  const yaw = Math.sin(t * 0.18) * 0.28;
-  const gridY = height * 0.72;
-
-  ctx.strokeStyle = "rgba(97, 213, 255, 0.12)";
-  ctx.lineWidth = 1;
-  for (let i = -8; i <= 8; i++) {
-    const a = project([i, -1.0, 0], width, height, yaw);
-    const b = project([i, -1.0, 8], width, height, yaw);
-    drawLine(ctx, a, b, "rgba(97, 213, 255, 0.10)", 1);
-  }
-  for (let z = 0; z <= 8; z++) {
-    const a = project([-8, -1.0, z], width, height, yaw);
-    const b = project([8, -1.0, z], width, height, yaw);
-    drawLine(ctx, a, b, "rgba(97, 213, 255, 0.10)", 1);
-  }
-
-  const urdfFrames = buildUrdfFrames();
-  if (urdfFrames && urdfFrames.edges.length) {
-    const min = urdfFrames.bbox.min;
-    const max = urdfFrames.bbox.max;
-    const size = max.map((value, axis) => Math.max(value - min[axis], 0.001));
-    const center = max.map((value, axis) => (value + min[axis]) / 2);
-    const scale = Math.min(3.6 / Math.max(size[1], 0.55), 3.4 / Math.max(size[2], 0.9), 3.2);
-    const mapPoint = (point) => [
-      (point[1] - center[1]) * scale,
-      (point[2] - min[2]) * scale - 1.05,
-      (point[0] - center[0]) * scale + 2.9,
-    ];
-    urdfFrames.edges.forEach((edge) => {
-      const parent = project(mapPoint(edge.parent), width, height, yaw);
-      const child = project(mapPoint(edge.child), width, height, yaw);
-      const moving = edge.joint.type !== "fixed";
-      drawLine(ctx, parent, child, moving ? "#d8f4ff" : "rgba(134, 168, 255, 0.55)", moving ? 3.5 : 1.5);
-      drawDot(ctx, child, moving ? 4 : 2.4, moving ? "#5ee493" : "#86a8ff");
-    });
-    const rootMat = urdfFrames.frames.get(state.urdf.root) || matIdentity();
-    const rootPoint = project(mapPoint(transformPoint(rootMat, [0, 0, 0])), width, height, yaw);
-    drawDot(ctx, rootPoint, 7, "#61d5ff");
-  } else {
-    const body = project([0, 0.42, 2.4], width, height, yaw);
-    const head = project([0, 1.02, 2.38], width, height, yaw);
-    const rear = project([0, 0.36, 2.95], width, height, yaw);
-    const front = project([0, 0.42, 1.86], width, height, yaw);
-    drawLine(ctx, rear, front, "#d8f4ff", 9);
-    drawLine(ctx, body, head, "#86a8ff", 5);
-    drawDot(ctx, head, 9, "#61d5ff");
-    drawDot(ctx, body, 7, "#5ee493");
-  }
-
-  const labelY = Math.max(28, gridY - 260);
-  ctx.fillStyle = "rgba(237, 244, 247, 0.92)";
-  ctx.font = "12px ui-sans-serif, system-ui";
-  ctx.fillText(
-    state.urdf ? `${state.urdf.model || state.config.robots[state.robotId].label} URDF tree from ${state.urdf.source}` : "Unitree URDF unavailable",
-    16,
-    labelY,
+function matrixFromUrdf(values) {
+  const matrix = new THREE.Matrix4();
+  matrix.set(
+    values[0], values[1], values[2], values[3],
+    values[4], values[5], values[6], values[7],
+    values[8], values[9], values[10], values[11],
+    values[12], values[13], values[14], values[15],
   );
-  ctx.fillStyle = "rgba(140, 153, 167, 0.95)";
-  const sourceLabel =
-    state.robotState?.source === "live"
-      ? "Live /joint_states applied"
-      : state.robotState?.source === "tf"
-        ? "Live /tf transforms applied"
-        : "Zero pose; waiting for live /joint_states or /tf";
-  ctx.fillText(sourceLabel, 16, labelY + 20);
+  return matrix;
 }
 
-setupInteractions();
+function resolveMeshUrl(filename) {
+  if (!state.urdf) return "";
+  const base = state.urdf.path.split("/").slice(0, -1).join("/");
+  if (filename.startsWith("package://")) {
+    const parts = filename.replace("package://", "").split("/");
+    const packageName = parts.shift();
+    if (base.endsWith(packageName)) return `/${base}/${parts.join("/")}`;
+    return `/${base}/${parts.join("/")}`;
+  }
+  if (filename.startsWith("file://")) return filename.replace("file://", "");
+  if (filename.startsWith("/")) return filename;
+  return `/${base}/${filename}`;
+}
+
+function clearRobotMeshes() {
+  if (!state.mesh.root) return;
+  state.mesh.root.clear();
+  state.mesh.links.clear();
+}
+
+function materialForLink(linkName) {
+  const color =
+    linkName.includes("left") || linkName.includes("_L") ? 0x9fc8ff :
+    linkName.includes("right") || linkName.includes("_R") ? 0xd7e3ee :
+    linkName.includes("head") ? 0xbcecff :
+    0xcfd6df;
+  return new THREE.MeshStandardMaterial({
+    color,
+    roughness: 0.48,
+    metalness: 0.18,
+    side: THREE.DoubleSide,
+  });
+}
+
+async function geometryForUrl(url) {
+  if (!state.mesh.geometryCache.has(url)) {
+    state.mesh.geometryCache.set(
+      url,
+      state.mesh.loader.loadAsync(url).then((geometry) => {
+        geometry.computeVertexNormals();
+        return geometry;
+      }),
+    );
+  }
+  return state.mesh.geometryCache.get(url);
+}
+
+async function loadRobotMeshes() {
+  const token = ++state.mesh.loadToken;
+  clearRobotMeshes();
+  if (!state.urdf || !state.mesh.root) return;
+
+  let loaded = 0;
+  const tasks = [];
+  state.urdf.links.forEach((linkName) => {
+    const linkGroup = new THREE.Group();
+    linkGroup.matrixAutoUpdate = false;
+    state.mesh.root.add(linkGroup);
+    state.mesh.links.set(linkName, linkGroup);
+    const visuals = state.urdf.linkVisuals.get(linkName) || [];
+    visuals.forEach((visual) => {
+      const url = resolveMeshUrl(visual.filename);
+      tasks.push(
+        geometryForUrl(url)
+          .then((geometry) => {
+            if (token !== state.mesh.loadToken) return;
+            const visualGroup = new THREE.Group();
+            visualGroup.matrixAutoUpdate = false;
+            visualGroup.matrix.copy(matrixFromUrdf(matMul(matTranslate(visual.xyz), matRpy(visual.rpy))));
+            visualGroup.matrixWorldNeedsUpdate = true;
+            const mesh = new THREE.Mesh(geometry, materialForLink(linkName));
+            mesh.scale.set(visual.scale[0], visual.scale[1], visual.scale[2]);
+            mesh.castShadow = false;
+            mesh.receiveShadow = false;
+            visualGroup.add(mesh);
+            linkGroup.add(visualGroup);
+            loaded += 1;
+            setText("#scene-meshes", `${loaded}/${state.urdf.meshCount} meshes`);
+          })
+          .catch((error) => {
+            console.warn(`mesh failed: ${url}`, error);
+          }),
+      );
+    });
+  });
+  await Promise.allSettled(tasks);
+  if (token === state.mesh.loadToken) {
+    setText("#scene-meshes", `${loaded}/${state.urdf.meshCount} meshes`);
+  }
+}
+
+function updateRobotMeshTransforms() {
+  const frames = buildUrdfFrames();
+  if (!frames) return;
+  state.mesh.links.forEach((group, linkName) => {
+    const matrix = frames.frames.get(linkName);
+    if (!matrix) return;
+    group.matrix.copy(matrixFromUrdf(matrix));
+    group.matrixWorldNeedsUpdate = true;
+  });
+}
+
+function resizeRenderer() {
+  const { renderer, camera } = state.mesh;
+  if (!renderer || !camera) return;
+  const canvas = renderer.domElement;
+  const rect = canvas.getBoundingClientRect();
+  const width = Math.max(1, Math.floor(rect.width));
+  const height = Math.max(1, Math.floor(rect.height));
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setSize(width, height, false);
+  camera.aspect = width / height;
+  camera.updateProjectionMatrix();
+}
+
+function renderScene() {
+  const { renderer, scene, camera } = state.mesh;
+  if (renderer && scene && camera) {
+    resizeRenderer();
+    updateRobotMeshTransforms();
+    renderer.render(scene, camera);
+  }
+  requestAnimationFrame(renderScene);
+}
+
 boot().catch((error) => {
   console.error(error);
   document.body.insertAdjacentHTML(
