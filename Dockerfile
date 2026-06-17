@@ -12,6 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     psmisc \
     python3-opencv \
     python3-pip \
+    ros-humble-rmw-cyclonedds-cpp \
+    ros-humble-sensor-msgs-py \
     v4l-utils \
     && rm -rf /var/lib/apt/lists/*
 
@@ -24,4 +26,3 @@ COPY . /app
 
 EXPOSE 8787
 CMD ["/app/scripts/run_local.sh"]
-

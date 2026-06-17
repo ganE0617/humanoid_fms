@@ -12,6 +12,7 @@ const state = {
   urdf: null,
   robotState: null,
   depthState: null,
+  missionState: null,
   mesh: {
     renderer: null,
     scene: null,
@@ -54,6 +55,17 @@ function fetchJson(path) {
   });
 }
 
+function postJson(path, payload) {
+  return fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }).then((response) => {
+    if (!response.ok) throw new Error(`${path} ${response.status}`);
+    return response.json();
+  });
+}
+
 function statusClass(cam) {
   if (!cam.exists) return "bad";
   if (cam.busy) return "warn";
@@ -70,10 +82,12 @@ async function boot() {
   await refreshStatus();
   await refreshRobotState();
   await refreshDepthState();
+  await refreshMissionState();
   setupInteractions();
   setInterval(refreshStatus, 2500);
   setInterval(refreshRobotState, 80);
   setInterval(refreshDepthState, 180);
+  setInterval(refreshMissionState, 1000);
   setInterval(updateClock, 500);
   requestAnimationFrame(renderScene);
 }
@@ -173,7 +187,45 @@ function renderDepthLabel() {
   }
   const age = Math.max(0, Date.now() / 1000 - depth.lastDepthTime).toFixed(1);
   const nearest = depth.nearestMeters ? ` near ${Number(depth.nearestMeters).toFixed(2)}m` : "";
-  setText("#scene-depth", `${points.length} pts${nearest} / ${normalizeFrameId(depth.frameId)} / ${age}s`);
+  const source = depth.dataSource ? `${depth.dataSource} ` : "";
+  setText("#scene-depth", `${source}${points.length} pts${nearest} / ${normalizeFrameId(depth.frameId)} / ${age}s`);
+}
+
+async function refreshMissionState() {
+  try {
+    state.missionState = await fetchJson("/api/mission-state");
+    renderMissionPanel();
+  } catch (error) {
+    setText("#mission-stage", "OFFLINE");
+    setText("#mission-last", "mission API offline");
+  }
+}
+
+async function sendMissionSignal(signal) {
+  setText("#mission-last", `${signal.toUpperCase()} sending`);
+  try {
+    state.missionState = await postJson("/api/mission-signal", { signal });
+    renderMissionPanel();
+  } catch (error) {
+    setText("#mission-last", `${signal.toUpperCase()} failed`);
+    console.error(error);
+  }
+}
+
+function renderMissionPanel() {
+  const mission = state.missionState || { stage: "idle", events: [] };
+  const stage = String(mission.stage || "idle").toUpperCase();
+  setText("#mission-stage", stage);
+  setText("#mission-topic", mission.topic || "/fms/mission_events");
+  const last = (mission.events || []).at(-1);
+  const label = last
+    ? `${last.label || last.signal} #${last.seq} ${new Date(last.time * 1000).toLocaleTimeString("en-GB", { hour12: false })}`
+    : "waiting";
+  setText("#mission-last", label);
+  const panel = $(".mission-panel");
+  if (panel) {
+    panel.dataset.stage = mission.stage || "idle";
+  }
 }
 
 function parseVector(value, fallback = [0, 0, 0]) {
@@ -243,6 +295,7 @@ function parseUrdf(payload) {
     source: payload.source,
     model: payload.model,
     root,
+    frameAliases: payload.frameAliases || {},
     links,
     joints,
     movingJoints,
@@ -453,6 +506,10 @@ function setupInteractions() {
     });
   });
 
+  document.querySelectorAll("[data-mission]").forEach((button) => {
+    button.addEventListener("click", () => sendMissionSignal(button.dataset.mission));
+  });
+
   const arm = $("#arm-button");
   arm.addEventListener("mousedown", () => {
     state.armed = true;
@@ -573,7 +630,8 @@ function matOpticalToRobotForward() {
 }
 
 function normalizeFrameId(frameId) {
-  return String(frameId || "").replace(/^\/+/, "");
+  const normalized = String(frameId || "").replace(/^\/+/, "");
+  return state.urdf?.frameAliases?.[normalized] || normalized;
 }
 
 function tfByChild() {

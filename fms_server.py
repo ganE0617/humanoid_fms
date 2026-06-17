@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -109,6 +109,40 @@ class V4L2CtlCapture:
         frame = np.frombuffer(raw[:expected], dtype=np.uint8).reshape((self.height, self.width, 2))
         code = cv2.COLOR_YUV2BGR_UYVY if self.pixel_format == "UYVY" else cv2.COLOR_YUV2BGR_YUYV
         return True, cv2.cvtColor(frame, code)
+
+    def release(self):
+        try:
+            self.frame_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+class Z16DepthCapture:
+    def __init__(self, device: str, width: int, height: int):
+        self.device = str(resolve_device(device) or device)
+        self.width = width
+        self.height = height
+        self.frame_path = Path(f"/tmp/humanoid-fms-depth-{os.getpid()}-{abs(hash((self.device, width, height))) % 100000}.z16")
+
+    def read(self):
+        command = [
+            "v4l2-ctl",
+            "-d",
+            self.device,
+            f"--set-fmt-video=width={self.width},height={self.height},pixelformat=Z16 ",
+            "--stream-mmap",
+            "--stream-count=1",
+            f"--stream-to={self.frame_path}",
+        ]
+        proc = run(command, timeout=3.0)
+        if proc.returncode != 0 or not self.frame_path.exists():
+            return False, None
+        raw = self.frame_path.read_bytes()
+        expected = self.width * self.height * 2
+        if len(raw) < expected:
+            return False, None
+        frame = np.frombuffer(raw[:expected], dtype=np.uint16).reshape((self.height, self.width))
+        return True, frame.copy()
 
     def release(self):
         try:
@@ -257,6 +291,40 @@ done
     return access
 
 
+def depth_points_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[list[list[float]], float]:
+    height, width = frame.shape[:2]
+    max_points = max(100, min(12000, int(config.get("maxPoints", 2400))))
+    scale = float(config.get("depthScaleMeters", 0.001))
+    near = float(config.get("nearMeters", 0.18))
+    far = float(config.get("farMeters", 3.0))
+    hfov = np.deg2rad(float(config.get("horizontalFovDeg", 87)))
+    vfov = np.deg2rad(float(config.get("verticalFovDeg", 58)))
+    fx = width / (2.0 * np.tan(hfov / 2.0))
+    fy = height / (2.0 * np.tan(vfov / 2.0))
+    cx = (width - 1) / 2.0
+    cy = (height - 1) / 2.0
+    stride = max(2, int((width * height / max_points) ** 0.5))
+    points: list[list[float]] = []
+    nearest = 0.0
+    for v in range(0, height, stride):
+        row = frame[v]
+        for u in range(0, width, stride):
+            raw = int(row[u])
+            if raw <= 0 or raw >= 65535:
+                continue
+            z = raw * scale
+            if z < near or z > far:
+                continue
+            x = (u - cx) * z / fx
+            y = (v - cy) * z / fy
+            distance = float((x * x + y * y + z * z) ** 0.5)
+            nearest = distance if nearest <= 0.0 else min(nearest, distance)
+            points.append([round(float(x), 4), round(float(y), 4), round(float(z), 4)])
+            if len(points) >= max_points:
+                return points, nearest
+    return points, nearest
+
+
 class RosMonitor:
     def __init__(self, robot_id: str):
         self.robot_id = robot_id
@@ -273,10 +341,17 @@ class RosMonitor:
         self.depth_error = ""
         self.depth_total = 0
         self.depth_nearest = 0.0
+        self.depth_source = ""
+        self.mission_seq = 0
+        self.mission_stage = "idle"
+        self.mission_queue: list[dict[str, Any]] = []
+        self.mission_events: list[dict[str, Any]] = []
         self.thread = threading.Thread(target=self._run, name="fms-ros-monitor", daemon=True)
+        self.depth_thread = threading.Thread(target=self._run_depth_fallback, name="fms-depth-fallback", daemon=True)
 
     def start(self) -> None:
         self.thread.start()
+        self.depth_thread.start()
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -303,8 +378,93 @@ class RosMonitor:
                 "points": self.depth_points,
                 "total": self.depth_total,
                 "nearestMeters": self.depth_nearest,
+                "dataSource": self.depth_source,
                 "config": depth,
             }
+
+    def mission_snapshot(self) -> dict[str, Any]:
+        topic = robot_configs().get(self.robot_id, {}).get("topics", {}).get("missionEvents", "/fms/mission_events")
+        with self.lock:
+            return {
+                "stage": self.mission_stage,
+                "seq": self.mission_seq,
+                "topic": topic,
+                "events": self.mission_events[-8:],
+            }
+
+    def send_mission_signal(self, signal: str) -> dict[str, Any]:
+        normalized = str(signal or "").strip().lower()
+        if normalized not in {"start", "complete", "ok", "reset"}:
+            raise HTTPException(status_code=400, detail="signal must be start, complete, ok, or reset")
+        labels = {
+            "start": "START",
+            "complete": "COMPLETE",
+            "ok": "OK_SIGN",
+            "reset": "RESET",
+        }
+        stages = {
+            "start": "started",
+            "complete": "completed",
+            "ok": "ok",
+            "reset": "idle",
+        }
+        with self.lock:
+            self.mission_seq += 1
+            self.mission_stage = stages[normalized]
+            event = {
+                "seq": self.mission_seq,
+                "signal": normalized,
+                "label": labels[normalized],
+                "time": time.time(),
+                "robotId": self.robot_id,
+            }
+            self.mission_events.append(event)
+            self.mission_events = self.mission_events[-40:]
+            self.mission_queue.append(event)
+        return self.mission_snapshot()
+
+    def _run_depth_fallback(self) -> None:
+        while True:
+            try:
+                robot = robot_configs().get(self.robot_id, {})
+                depth = robot.get("depthSensor", {})
+                device = depth.get("fallbackDevice", "")
+                if not device or not Path(device).exists():
+                    time.sleep(1.0)
+                    continue
+                with self.lock:
+                    recent_ros_points = self.depth_source == "ros" and self.last_depth_time and time.time() - self.last_depth_time < 1.2
+                if recent_ros_points:
+                    time.sleep(0.5)
+                    continue
+
+                width, height = depth.get("fallbackResolution", [640, 480])
+                width = int(width)
+                height = int(height)
+                capture = Z16DepthCapture(device, width, height)
+                ok, frame = capture.read()
+                capture.release()
+                if not ok or frame is None:
+                    with self.lock:
+                        if not self.depth_source:
+                            self.depth_error = f"depth device unavailable: {device}"
+                    time.sleep(1.0)
+                    continue
+
+                points, nearest = depth_points_from_z16(frame, depth)
+                with self.lock:
+                    self.depth_points = points
+                    self.depth_frame = depth.get("fallbackOpticalFrame", "camera_depth_optical_frame")
+                    self.last_depth_time = time.time()
+                    self.depth_total = int(frame.size)
+                    self.depth_nearest = round(nearest, 3) if nearest else 0.0
+                    self.depth_source = "v4l2-z16"
+                    self.depth_error = ""
+                time.sleep(1.0 / max(0.5, float(depth.get("fallbackFps", 2))))
+            except Exception as exc:
+                with self.lock:
+                    self.depth_error = f"depth fallback {type(exc).__name__}: {exc}"
+                time.sleep(1.0)
 
     def _run(self) -> None:
         if os.getenv("FMS_ENABLE_ROS", "1") == "0":
@@ -314,6 +474,7 @@ class RosMonitor:
         try:
             import rclpy
             from rclpy.node import Node
+            from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
             from sensor_msgs.msg import JointState
             from tf2_msgs.msg import TFMessage
         except Exception as exc:
@@ -324,6 +485,7 @@ class RosMonitor:
 
         point_cloud2 = None
         PointCloud2 = None
+        String = None
         try:
             from sensor_msgs.msg import PointCloud2 as RosPointCloud2
             from sensor_msgs_py import point_cloud2 as ros_point_cloud2
@@ -333,6 +495,12 @@ class RosMonitor:
         except Exception as exc:
             with self.lock:
                 self.depth_error = f"PointCloud2 unavailable: {type(exc).__name__}: {exc}"
+        try:
+            from std_msgs.msg import String as RosString
+
+            String = RosString
+        except Exception:
+            String = None
 
         robots = robot_configs()
         robot = robots.get(self.robot_id) or robots.get("unitree") or {}
@@ -345,7 +513,20 @@ class RosMonitor:
         low_state_joint_names = [name for name in robot.get("lowStateJointNames", []) if name]
         depth_config = robot.get("depthSensor", {})
         point_cloud_topic = depth_config.get("pointCloudTopic") or topics.get("pointCloud", "")
+        mission_topic = topics.get("missionEvents", "/fms/mission_events")
         max_depth_points = max(100, min(12000, int(depth_config.get("maxPoints", 2400))))
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
+        tf_static_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
 
         low_state_msg_type = None
         low_state_error = ""
@@ -363,14 +544,16 @@ class RosMonitor:
             class FmsRosNode(Node):
                 def __init__(node_self):
                     super().__init__("humanoid_fms_monitor")
-                    node_self.create_subscription(JointState, joint_topic, node_self.on_joint, 20)
-                    node_self.create_subscription(TFMessage, tf_topic, node_self.on_tf, 20)
-                    node_self.create_subscription(TFMessage, tf_static_topic, node_self.on_tf, 10)
+                    node_self.create_subscription(JointState, joint_topic, node_self.on_joint, sensor_qos)
+                    node_self.create_subscription(TFMessage, tf_topic, node_self.on_tf, sensor_qos)
+                    node_self.create_subscription(TFMessage, tf_static_topic, node_self.on_tf, tf_static_qos)
                     if point_cloud_topic and PointCloud2 is not None:
-                        node_self.create_subscription(PointCloud2, point_cloud_topic, node_self.on_point_cloud, 5)
+                        node_self.create_subscription(PointCloud2, point_cloud_topic, node_self.on_point_cloud, sensor_qos)
+                    node_self.mission_pub = node_self.create_publisher(String, mission_topic, 10) if String else None
+                    node_self.create_timer(0.1, node_self.publish_mission_events)
                     if low_state_msg_type and low_state_joint_names:
                         for topic in {low_state_topic, low_state_lf_topic} - {""}:
-                            node_self.create_subscription(low_state_msg_type, topic, node_self.on_low_state, 20)
+                            node_self.create_subscription(low_state_msg_type, topic, node_self.on_low_state, sensor_qos)
 
                 def on_joint(node_self, msg):
                     now = time.time()
@@ -379,6 +562,7 @@ class RosMonitor:
                         self.joints.update(data)
                         self.last_joint_time = now
                         self.source = "live"
+                        self.error = ""
 
                 def on_low_state(node_self, msg):
                     now = time.time()
@@ -394,6 +578,7 @@ class RosMonitor:
                         self.joints.update(data)
                         self.last_joint_time = now
                         self.source = "lowstate"
+                        self.error = ""
 
                 def on_tf(node_self, msg):
                     now = time.time()
@@ -422,6 +607,7 @@ class RosMonitor:
                         self.last_tf_time = now
                         if self.source != "live":
                             self.source = "tf"
+                        self.error = ""
 
                 def on_point_cloud(node_self, msg):
                     now = time.time()
@@ -449,16 +635,27 @@ class RosMonitor:
                             self.last_depth_time = now
                             self.depth_total = total
                             self.depth_nearest = round(nearest, 3)
+                            self.depth_source = "ros"
                             self.depth_error = ""
                     except Exception as exc:
                         with self.lock:
                             self.depth_error = f"{type(exc).__name__}: {exc}"
 
+                def publish_mission_events(node_self):
+                    if not node_self.mission_pub:
+                        return
+                    with self.lock:
+                        events = self.mission_queue[:]
+                        self.mission_queue.clear()
+                    for event in events:
+                        msg = String()
+                        msg.data = json.dumps(event, separators=(",", ":"))
+                        node_self.mission_pub.publish(msg)
+
             node = FmsRosNode()
             with self.lock:
                 self.source = "waiting"
-                if low_state_topic and not low_state_msg_type and low_state_error:
-                    self.error = f"lowstate type unavailable: {low_state_error}"
+                self.error = ""
             rclpy.spin(node)
         except Exception as exc:
             with self.lock:
@@ -550,6 +747,7 @@ def get_robot_urdf(robot_id: str) -> JSONResponse:
             "source": robot.get("urdf", {}).get("source", robot.get("repo", "")),
             "path": urdf_path,
             "rootFrame": robot.get("urdf", {}).get("rootFrame", ""),
+            "frameAliases": robot.get("urdf", {}).get("frameAliases", {}),
             "xml": xml,
         }
     )
@@ -582,6 +780,20 @@ def get_depth_state() -> JSONResponse:
     if _ROS_MONITOR is None:
         return JSONResponse({"source": "not-started", "points": [], "config": {}})
     return JSONResponse(_ROS_MONITOR.depth_snapshot())
+
+
+@app.get("/api/mission-state")
+def get_mission_state() -> JSONResponse:
+    if _ROS_MONITOR is None:
+        return JSONResponse({"stage": "not-started", "events": [], "topic": "/fms/mission_events"})
+    return JSONResponse(_ROS_MONITOR.mission_snapshot())
+
+
+@app.post("/api/mission-signal")
+def post_mission_signal(payload: dict[str, Any] = Body(default={})) -> JSONResponse:
+    if _ROS_MONITOR is None:
+        raise HTTPException(status_code=503, detail="ROS monitor not started")
+    return JSONResponse(_ROS_MONITOR.send_mission_signal(str(payload.get("signal", ""))))
 
 
 @app.get("/api/status")

@@ -72,6 +72,21 @@
             <strong>URDF/TF READY</strong>
           </div>
           <canvas id="scene-canvas" width="960" height="720"></canvas>
+          <div class="mission-panel" aria-label="Mission signals">
+            <div class="mission-head">
+              <span>Mission Signals</span>
+              <strong id="mission-stage">IDLE</strong>
+            </div>
+            <div class="mission-actions">
+              <button data-mission="start">START</button>
+              <button data-mission="complete">COMPLETE</button>
+              <button data-mission="ok">OK</button>
+            </div>
+            <div class="mission-state">
+              <span id="mission-topic">/fms/mission_events</span>
+              <b id="mission-last">waiting</b>
+            </div>
+          </div>
           <div class="scene-overlay">
             <span id="scene-root">base_link</span>
             <span id="scene-source">URDF loading</span>
@@ -107,6 +122,6 @@
         }
       }
     </script>
-    <script type="module" src="/app.js?v=20260617-depth-view"></script>
+    <script type="module" src="/app.js?v=20260617-mission-signals"></script>
   </body>
 </html>

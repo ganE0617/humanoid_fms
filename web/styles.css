@@ -468,7 +468,103 @@ select {
   display: block;
   background:
     linear-gradient(180deg, #101821, #080b0f 68%),
-    #080b0f;
+  #080b0f;
+}
+
+.mission-panel {
+  position: absolute;
+  top: 45px;
+  right: 10px;
+  width: 250px;
+  display: grid;
+  gap: 8px;
+  padding: 9px;
+  border: 1px solid rgba(94, 228, 147, 0.24);
+  border-radius: 7px;
+  background: rgba(7, 11, 15, 0.82);
+  box-shadow: 0 12px 26px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(8px);
+  z-index: 3;
+}
+
+.mission-head,
+.mission-state {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mission-head span,
+.mission-state span {
+  color: var(--muted);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mission-head strong {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.mission-panel[data-stage="started"] .mission-head strong {
+  color: var(--cyan);
+}
+
+.mission-panel[data-stage="completed"] .mission-head strong {
+  color: var(--amber);
+}
+
+.mission-panel[data-stage="ok"] .mission-head strong {
+  color: var(--green);
+}
+
+.mission-actions {
+  display: grid;
+  grid-template-columns: 1fr 1.2fr 0.8fr;
+  gap: 6px;
+}
+
+.mission-actions button {
+  min-width: 0;
+  height: 31px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0a1016;
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.mission-actions button[data-mission="start"] {
+  color: var(--cyan);
+}
+
+.mission-actions button[data-mission="complete"] {
+  color: var(--amber);
+}
+
+.mission-actions button[data-mission="ok"] {
+  color: var(--green);
+}
+
+.mission-actions button:active {
+  transform: translateY(1px);
+}
+
+.mission-state b {
+  min-width: 82px;
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 650;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .scene-overlay {

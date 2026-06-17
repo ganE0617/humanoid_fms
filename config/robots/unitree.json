@@ -7,7 +7,10 @@
   "urdf": {
     "source": "unitreerobotics/unitree_ros",
     "path": "vendor/unitree_ros/robots/go2_description/urdf/go2_description.urdf",
-    "rootFrame": "base"
+    "rootFrame": "base",
+    "frameAliases": {
+      "base_link": "base"
+    }
   },
   "topics": {
     "jointStates": "/joint_states",
@@ -17,6 +20,7 @@
     "cmdVel": "/cmd_vel",
     "pointCloud": "/camera/depth/color/points",
     "depthCameraInfo": "/camera/depth/camera_info",
+    "missionEvents": "/fms/mission_events",
     "lowState": "/lowstate",
     "lowStateLf": "/lf/lowstate"
   },
@@ -31,6 +35,10 @@
     "fallbackParentFrame": "base",
     "fallbackOpticalFrame": "camera_depth_optical_frame",
     "fallbackOrigin": [0.28, 0.0, 0.18],
+    "fallbackDevice": "/dev/video4",
+    "fallbackResolution": [640, 480],
+    "fallbackFps": 2,
+    "depthScaleMeters": 0.001,
     "horizontalFovDeg": 87,
     "verticalFovDeg": 58,
     "nearMeters": 0.18,
