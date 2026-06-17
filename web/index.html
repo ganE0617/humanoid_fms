@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Humanoid FMS</title>
-    <link rel="stylesheet" href="/styles.css?v=20260617-depth-hold-pose" />
+    <link rel="stylesheet" href="/styles.css?v=20260617-depth-hud" />
   </head>
   <body class="adapter-collapsed status-collapsed">
     <main class="shell">
@@ -72,6 +72,25 @@
             <strong>URDF/TF READY</strong>
           </div>
           <canvas id="scene-canvas" width="960" height="720"></canvas>
+          <div class="depth-hud" aria-label="Depth camera">
+            <div class="depth-hud-head">
+              <span>Depth Camera</span>
+              <strong id="depth-center">-- m</strong>
+            </div>
+            <div class="depth-preview">
+              <img id="depth-preview" alt="Depth camera heatmap" />
+              <span class="depth-crosshair"></span>
+            </div>
+            <div class="depth-scale">
+              <span id="depth-near">near</span>
+              <i></i>
+              <span id="depth-far">far</span>
+            </div>
+            <div class="depth-metrics">
+              <span>nearest <b id="depth-nearest">--</b></span>
+              <span>valid <b id="depth-coverage">--</b></span>
+            </div>
+          </div>
           <div class="mission-panel" aria-label="Mission signals">
             <div class="mission-head">
               <span>Mission Signals</span>
@@ -122,6 +141,6 @@
         }
       }
     </script>
-    <script type="module" src="/app.js?v=20260617-depth-hold-pose"></script>
+    <script type="module" src="/app.js?v=20260617-depth-hud"></script>
   </body>
 </html>

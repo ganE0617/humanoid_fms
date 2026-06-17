@@ -241,6 +241,7 @@ async function refreshDepthState() {
 function renderDepthLabel() {
   const depth = state.depthState || {};
   const points = depth.points || [];
+  renderDepthHud(depth);
   if (depth.error) {
     setText("#scene-depth", depth.error.slice(0, 58));
     return;
@@ -254,6 +255,29 @@ function renderDepthLabel() {
   const nearest = depth.nearestMeters ? ` near ${Number(depth.nearestMeters).toFixed(2)}m` : "";
   const source = depth.dataSource ? `${depth.dataSource} ` : "";
   setText("#scene-depth", `${source}${points.length} pts${nearest} / ${normalizeFrameId(depth.frameId)} / ${age}s`);
+}
+
+function formatMeters(value) {
+  const number = Number(value || 0);
+  return number > 0 ? `${number.toFixed(2)} m` : "-- m";
+}
+
+function renderDepthHud(depth) {
+  const preview = $("#depth-preview");
+  const stats = depth.stats || {};
+  const config = depth.config || {};
+  if (preview && depth.previewUrl) {
+    const url = depth.previewUrl.includes("?") ? `${depth.previewUrl}&r=${Math.floor(Date.now() / 500)}` : `${depth.previewUrl}?r=${Math.floor(Date.now() / 500)}`;
+    if (preview.dataset.src !== url) {
+      preview.dataset.src = url;
+      preview.src = url;
+    }
+  }
+  setText("#depth-center", formatMeters(stats.centerMeters));
+  setText("#depth-nearest", formatMeters(stats.nearestMeters || depth.nearestMeters));
+  setText("#depth-coverage", Number.isFinite(Number(stats.coverage)) ? `${Math.round(Number(stats.coverage) * 100)}%` : "--");
+  setText("#depth-near", formatMeters(stats.nearMeters || config.nearMeters));
+  setText("#depth-far", formatMeters(stats.farMeters || config.farMeters));
 }
 
 async function refreshMissionState() {

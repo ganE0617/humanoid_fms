@@ -15,7 +15,7 @@ from urllib.parse import quote
 import cv2
 import numpy as np
 from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 
@@ -351,6 +351,53 @@ def depth_points_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[li
     return points, nearest, surface
 
 
+def depth_preview_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
+    scale = float(config.get("depthScaleMeters", 0.001))
+    near = float(config.get("nearMeters", 0.18))
+    far = float(config.get("farMeters", 3.0))
+    depth_m = frame.astype(np.float32) * scale
+    valid = (frame > 0) & (frame < 65535) & (depth_m >= near) & (depth_m <= far)
+    clipped = np.clip(depth_m, near, far)
+    inverse = ((far - clipped) / max(0.001, far - near) * 255.0).astype(np.uint8)
+    color = cv2.applyColorMap(inverse, cv2.COLORMAP_TURBO)
+    color[~valid] = (13, 18, 24)
+
+    height, width = frame.shape[:2]
+    cx = width // 2
+    cy = height // 2
+    roi = max(12, min(width, height) // 14)
+    patch = depth_m[max(0, cy - roi):min(height, cy + roi), max(0, cx - roi):min(width, cx + roi)]
+    patch_valid = valid[max(0, cy - roi):min(height, cy + roi), max(0, cx - roi):min(width, cx + roi)]
+    center = float(np.median(patch[patch_valid])) if np.any(patch_valid) else 0.0
+    valid_depths = depth_m[valid]
+    nearest = float(np.min(valid_depths)) if valid_depths.size else 0.0
+    median = float(np.median(valid_depths)) if valid_depths.size else 0.0
+    coverage = float(np.count_nonzero(valid)) / float(frame.size or 1)
+
+    preview_width = int(config.get("previewWidth", 360))
+    preview_height = max(1, round(preview_width * height / width))
+    preview = cv2.resize(color, (preview_width, preview_height), interpolation=cv2.INTER_AREA)
+    sx = preview_width / width
+    sy = preview_height / height
+    pcx = int(cx * sx)
+    pcy = int(cy * sy)
+    proi = int(roi * sx)
+    cv2.line(preview, (pcx - 14, pcy), (pcx + 14, pcy), (245, 250, 255), 1, cv2.LINE_AA)
+    cv2.line(preview, (pcx, pcy - 14), (pcx, pcy + 14), (245, 250, 255), 1, cv2.LINE_AA)
+    cv2.rectangle(preview, (pcx - proi, pcy - proi), (pcx + proi, pcy + proi), (245, 250, 255), 1, cv2.LINE_AA)
+    ok, encoded = cv2.imencode(".png", preview, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+    if not ok:
+        return b"", {}
+    return encoded.tobytes(), {
+        "centerMeters": round(center, 3) if center else 0.0,
+        "nearestMeters": round(nearest, 3) if nearest else 0.0,
+        "medianMeters": round(median, 3) if median else 0.0,
+        "coverage": round(coverage, 3),
+        "nearMeters": near,
+        "farMeters": far,
+    }
+
+
 class RosMonitor:
     def __init__(self, robot_id: str):
         self.robot_id = robot_id
@@ -365,6 +412,8 @@ class RosMonitor:
         self.depth_frame = ""
         self.depth_points: list[list[float]] = []
         self.depth_surface: dict[str, Any] = {}
+        self.depth_preview_png = b""
+        self.depth_stats: dict[str, Any] = {}
         self.depth_error = ""
         self.depth_total = 0
         self.depth_nearest = 0.0
@@ -404,6 +453,8 @@ class RosMonitor:
                 "lastDepthTime": self.last_depth_time,
                 "points": self.depth_points,
                 "surface": self.depth_surface,
+                "stats": self.depth_stats,
+                "previewUrl": f"/api/depth-preview.png?t={int(self.last_depth_time * 1000)}" if self.depth_preview_png else "",
                 "total": self.depth_total,
                 "nearestMeters": self.depth_nearest,
                 "dataSource": self.depth_source,
@@ -480,9 +531,12 @@ class RosMonitor:
                     continue
 
                 points, nearest, surface = depth_points_from_z16(frame, depth)
+                preview_png, depth_stats = depth_preview_from_z16(frame, depth)
                 with self.lock:
                     self.depth_points = points
                     self.depth_surface = surface
+                    self.depth_preview_png = preview_png
+                    self.depth_stats = depth_stats
                     self.depth_frame = depth.get("fallbackOpticalFrame", "camera_depth_optical_frame")
                     self.last_depth_time = time.time()
                     self.depth_total = int(frame.size)
@@ -661,6 +715,7 @@ class RosMonitor:
                         with self.lock:
                             self.depth_points = points
                             self.depth_surface = {}
+                            self.depth_stats = {"nearestMeters": round(nearest, 3)}
                             self.depth_frame = msg.header.frame_id
                             self.last_depth_time = now
                             self.depth_total = total
@@ -810,6 +865,17 @@ def get_depth_state() -> JSONResponse:
     if _ROS_MONITOR is None:
         return JSONResponse({"source": "not-started", "points": [], "config": {}})
     return JSONResponse(_ROS_MONITOR.depth_snapshot())
+
+
+@app.get("/api/depth-preview.png")
+def get_depth_preview() -> Response:
+    if _ROS_MONITOR is None:
+        raise HTTPException(status_code=404, detail="depth monitor not started")
+    with _ROS_MONITOR.lock:
+        content = _ROS_MONITOR.depth_preview_png
+    if not content:
+        raise HTTPException(status_code=404, detail="depth preview unavailable")
+    return Response(content=content, media_type="image/png", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/mission-state")
