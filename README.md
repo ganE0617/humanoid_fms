@@ -71,10 +71,9 @@ this repo:
 
 Default URDF targets:
 
-- Unitree: `vendor/unitree_ros/robots/g1_description/g1_29dof.urdf`
+- Unitree: `vendor/unitree_ros/robots/go2_description/urdf/go2_description.urdf`
 - AI Worker: `vendor/ai_worker/ffw_description/urdf/ffw_bg2_rev4_follower/ffw_bg2_follower.urdf`
 
 The web scene parses the URDF joint tree and applies live `/joint_states` data
 when ROS 2 is visible inside the container. If no ROS messages have arrived yet,
 the scene stays in a clearly marked waiting/demo preview state.
-

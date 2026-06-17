@@ -1,22 +1,50 @@
 {
   "id": "unitree",
-  "label": "Unitree G1",
-  "model": "G1 29DOF",
+  "label": "Unitree Go2 EDU",
+  "model": "Go2 EDU",
   "repo": "unitreerobotics/unitree_ros",
-  "description": "Unitree G1 29DOF URDF from the official unitree_ros repository.",
+  "description": "Unitree Go2 EDU URDF from the official unitree_ros repository.",
   "urdf": {
     "source": "unitreerobotics/unitree_ros",
-    "path": "vendor/unitree_ros/robots/g1_description/g1_29dof.urdf",
-    "rootFrame": "pelvis"
+    "path": "vendor/unitree_ros/robots/go2_description/urdf/go2_description.urdf",
+    "rootFrame": "base"
   },
   "topics": {
     "jointStates": "/joint_states",
     "tf": "/tf",
     "tfStatic": "/tf_static",
-    "odom": "/utlidar/robot_odom",
+    "odom": "/odom",
     "cmdVel": "/cmd_vel",
     "lowState": "/lowstate",
     "lowStateLf": "/lf/lowstate"
+  },
+  "lowStateJointNames": [
+    "FL_hip_joint",
+    "FL_thigh_joint",
+    "FL_calf_joint",
+    "FR_hip_joint",
+    "FR_thigh_joint",
+    "FR_calf_joint",
+    "RL_hip_joint",
+    "RL_thigh_joint",
+    "RL_calf_joint",
+    "RR_hip_joint",
+    "RR_thigh_joint",
+    "RR_calf_joint"
+  ],
+  "defaultJointPositions": {
+    "FL_hip_joint": 0.0,
+    "FL_thigh_joint": 0.78,
+    "FL_calf_joint": -1.52,
+    "FR_hip_joint": 0.0,
+    "FR_thigh_joint": 0.78,
+    "FR_calf_joint": -1.52,
+    "RL_hip_joint": 0.0,
+    "RL_thigh_joint": 0.78,
+    "RL_calf_joint": -1.52,
+    "RR_hip_joint": 0.0,
+    "RR_thigh_joint": 0.78,
+    "RR_calf_joint": -1.52
   },
   "cameraSlots": [
     "logitech_front",

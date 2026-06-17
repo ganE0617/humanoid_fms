@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 import http.client
+import importlib
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -277,6 +278,7 @@ class RosMonitor:
                 "source": self.source,
                 "error": self.error,
                 "robotId": self.robot_id,
+                "defaultJoints": robot_configs().get(self.robot_id, {}).get("defaultJointPositions", {}),
                 "lastJointTime": self.last_joint_time,
                 "lastTfTime": self.last_tf_time,
                 "joints": self.joints,
@@ -305,6 +307,19 @@ class RosMonitor:
         joint_topic = topics.get("jointStates", "/joint_states")
         tf_topic = topics.get("tf", "/tf")
         tf_static_topic = topics.get("tfStatic", "/tf_static")
+        low_state_topic = topics.get("lowState", "")
+        low_state_lf_topic = topics.get("lowStateLf", "")
+        low_state_joint_names = [name for name in robot.get("lowStateJointNames", []) if name]
+
+        low_state_msg_type = None
+        low_state_error = ""
+        for type_path in ("unitree_go.msg.LowState", "unitree_go.msg.dds_.LowState_"):
+            try:
+                module_name, class_name = type_path.rsplit(".", 1)
+                low_state_msg_type = getattr(importlib.import_module(module_name), class_name)
+                break
+            except Exception as exc:
+                low_state_error = f"{type(exc).__name__}: {exc}"
 
         try:
             rclpy.init(args=None)
@@ -315,6 +330,9 @@ class RosMonitor:
                     node_self.create_subscription(JointState, joint_topic, node_self.on_joint, 20)
                     node_self.create_subscription(TFMessage, tf_topic, node_self.on_tf, 20)
                     node_self.create_subscription(TFMessage, tf_static_topic, node_self.on_tf, 10)
+                    if low_state_msg_type and low_state_joint_names:
+                        for topic in {low_state_topic, low_state_lf_topic} - {""}:
+                            node_self.create_subscription(low_state_msg_type, topic, node_self.on_low_state, 20)
 
                 def on_joint(node_self, msg):
                     now = time.time()
@@ -323,6 +341,21 @@ class RosMonitor:
                         self.joints.update(data)
                         self.last_joint_time = now
                         self.source = "live"
+
+                def on_low_state(node_self, msg):
+                    now = time.time()
+                    motor_state = getattr(msg, "motor_state", None) or getattr(msg, "motorState", None) or []
+                    data = {}
+                    for name, motor in zip(low_state_joint_names, motor_state):
+                        q = getattr(motor, "q", None)
+                        if q is not None:
+                            data[name] = float(q)
+                    if not data:
+                        return
+                    with self.lock:
+                        self.joints.update(data)
+                        self.last_joint_time = now
+                        self.source = "lowstate"
 
                 def on_tf(node_self, msg):
                     now = time.time()
@@ -355,6 +388,8 @@ class RosMonitor:
             node = FmsRosNode()
             with self.lock:
                 self.source = "waiting"
+                if low_state_topic and not low_state_msg_type and low_state_error:
+                    self.error = f"lowstate type unavailable: {low_state_error}"
             rclpy.spin(node)
         except Exception as exc:
             with self.lock:

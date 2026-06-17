@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { ColladaLoader } from "/lib/ColladaLoader.js";
 import { STLLoader } from "/lib/STLLoader.js";
 
 const state = {
@@ -16,8 +17,9 @@ const state = {
     camera: null,
     root: null,
     links: new Map(),
-    loader: new STLLoader(),
-    geometryCache: new Map(),
+    stlLoader: new STLLoader(),
+    colladaLoader: new ColladaLoader(),
+    assetCache: new Map(),
     loadToken: 0,
   },
 };
@@ -128,6 +130,8 @@ async function refreshRobotState() {
     const label =
       source === "live"
         ? `live /joint_states ${age}`
+        : source === "lowstate"
+          ? `live /lowstate ${age}`
         : source === "tf"
           ? `live /tf ${tfAge}`
           : "waiting for /joint_states or /tf";
@@ -557,12 +561,13 @@ function buildUrdfFrames() {
   const frames = new Map([[state.urdf.root, matIdentity()]]);
   const edges = [];
   const jointsByName = state.robotState?.joints || {};
+  const defaultJoints = state.robotState?.defaultJoints || {};
   const transforms = tfByChild();
   const visit = (link) => {
     const parentMat = frames.get(link);
     const childJoints = state.urdf.children.get(link) || [];
     childJoints.forEach((joint) => {
-      let angle = Number(jointsByName[joint.name] || 0);
+      let angle = Number(jointsByName[joint.name] ?? defaultJoints[joint.name] ?? 0);
       if (!Number.isFinite(angle)) angle = 0;
       const tf = transforms.get(normalizeFrameId(joint.child));
       let local;
@@ -637,15 +642,19 @@ function matrixFromUrdf(values) {
 
 function resolveMeshUrl(filename) {
   if (!state.urdf) return "";
-  const base = state.urdf.path.split("/").slice(0, -1).join("/");
   if (filename.startsWith("package://")) {
     const parts = filename.replace("package://", "").split("/");
     const packageName = parts.shift();
-    if (base.endsWith(packageName)) return `/${base}/${parts.join("/")}`;
-    return `/${base}/${parts.join("/")}`;
+    const urdfParts = state.urdf.path.split("/");
+    const packageIndex = urdfParts.lastIndexOf(packageName);
+    if (packageIndex >= 0) {
+      return `/${urdfParts.slice(0, packageIndex + 1).concat(parts).join("/")}`;
+    }
+    return `/${state.urdf.path.split("/").slice(0, -1).concat(parts).join("/")}`;
   }
   if (filename.startsWith("file://")) return filename.replace("file://", "");
   if (filename.startsWith("/")) return filename;
+  const base = state.urdf.path.split("/").slice(0, -1).join("/");
   return `/${base}/${filename}`;
 }
 
@@ -669,17 +678,46 @@ function materialForLink(linkName) {
   });
 }
 
-async function geometryForUrl(url) {
-  if (!state.mesh.geometryCache.has(url)) {
-    state.mesh.geometryCache.set(
-      url,
-      state.mesh.loader.loadAsync(url).then((geometry) => {
-        geometry.computeVertexNormals();
-        return geometry;
-      }),
-    );
+function cloneWithRuntimeMaterial(object, linkName) {
+  const clone = object.clone(true);
+  clone.traverse((child) => {
+    if (child.isMesh) {
+      child.material = child.material || materialForLink(linkName);
+      child.castShadow = false;
+      child.receiveShadow = false;
+    }
+  });
+  return clone;
+}
+
+async function objectForMeshUrl(url, linkName) {
+  const lower = url.toLowerCase();
+  if (!state.mesh.assetCache.has(url)) {
+    if (lower.endsWith(".dae")) {
+      state.mesh.assetCache.set(
+        url,
+        state.mesh.colladaLoader.loadAsync(url).then((collada) => collada.scene),
+      );
+    } else if (lower.endsWith(".stl")) {
+      state.mesh.assetCache.set(
+        url,
+        state.mesh.stlLoader.loadAsync(url).then((geometry) => {
+          geometry.computeVertexNormals();
+          return geometry;
+        }),
+      );
+    } else {
+      state.mesh.assetCache.set(url, Promise.reject(new Error(`unsupported mesh format: ${url}`)));
+    }
   }
-  return state.mesh.geometryCache.get(url);
+  const asset = await state.mesh.assetCache.get(url);
+  if (asset.isBufferGeometry) {
+    const mesh = new THREE.Mesh(asset, materialForLink(linkName));
+    mesh.castShadow = false;
+    mesh.receiveShadow = false;
+    return mesh;
+  }
+  return cloneWithRuntimeMaterial(asset, linkName);
 }
 
 async function loadRobotMeshes() {
@@ -698,18 +736,15 @@ async function loadRobotMeshes() {
     visuals.forEach((visual) => {
       const url = resolveMeshUrl(visual.filename);
       tasks.push(
-        geometryForUrl(url)
-          .then((geometry) => {
+        objectForMeshUrl(url, linkName)
+          .then((object) => {
             if (token !== state.mesh.loadToken) return;
             const visualGroup = new THREE.Group();
             visualGroup.matrixAutoUpdate = false;
             visualGroup.matrix.copy(matrixFromUrdf(matMul(matTranslate(visual.xyz), matRpy(visual.rpy))));
             visualGroup.matrixWorldNeedsUpdate = true;
-            const mesh = new THREE.Mesh(geometry, materialForLink(linkName));
-            mesh.scale.set(visual.scale[0], visual.scale[1], visual.scale[2]);
-            mesh.castShadow = false;
-            mesh.receiveShadow = false;
-            visualGroup.add(mesh);
+            object.scale.multiply(new THREE.Vector3(visual.scale[0], visual.scale[1], visual.scale[2]));
+            visualGroup.add(object);
             linkGroup.add(visualGroup);
             loaded += 1;
             setText("#scene-meshes", `${loaded}/${state.urdf.meshCount} meshes`);
@@ -722,6 +757,8 @@ async function loadRobotMeshes() {
   });
   await Promise.allSettled(tasks);
   if (token === state.mesh.loadToken) {
+    updateRobotMeshTransforms();
+    fitCameraToRobot();
     setText("#scene-meshes", `${loaded}/${state.urdf.meshCount} meshes`);
   }
 }
@@ -735,6 +772,32 @@ function updateRobotMeshTransforms() {
     group.matrix.copy(matrixFromUrdf(matrix));
     group.matrixWorldNeedsUpdate = true;
   });
+}
+
+function fitCameraToRobot() {
+  const { root, camera, scene } = state.mesh;
+  if (!root || !camera || !scene) return;
+  root.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(root);
+  if (!Number.isFinite(box.min.x) || box.isEmpty()) return;
+
+  const center = new THREE.Vector3();
+  const size = new THREE.Vector3();
+  box.getCenter(center);
+  box.getSize(size);
+  const maxDim = Math.max(size.x, size.y, size.z, 0.45);
+  const distance = Math.max(1.2, maxDim * 1.55);
+
+  camera.position.set(
+    center.x + distance * 0.95,
+    center.y + Math.max(0.45, maxDim * 0.55),
+    center.z + distance * 1.05,
+  );
+  camera.lookAt(center.x, center.y + size.y * 0.08, center.z);
+  camera.near = Math.max(0.01, distance / 100);
+  camera.far = Math.max(20, distance * 8);
+  camera.updateProjectionMatrix();
+  scene.fog = new THREE.Fog(0x081018, distance * 1.4, distance * 4.5);
 }
 
 function resizeRenderer() {

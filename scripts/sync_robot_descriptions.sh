@@ -24,12 +24,12 @@ sync_repo() {
   git -C "$dir" checkout -q
 }
 
-UNITREE_SPARSE_PATHS="${UNITREE_SPARSE_PATHS:-robots/g1_description}"
+UNITREE_SPARSE_PATHS="${UNITREE_SPARSE_PATHS:-robots/go2_description}"
 sync_repo "https://github.com/unitreerobotics/unitree_ros.git" "vendor/unitree_ros" $UNITREE_SPARSE_PATHS
 sync_repo "https://github.com/ROBOTIS-GIT/ai_worker.git" "vendor/ai_worker" ffw_description
 
 echo
 echo "URDF targets:"
 ls -lh \
-  vendor/unitree_ros/robots/g1_description/g1_29dof.urdf \
+  vendor/unitree_ros/robots/go2_description/urdf/go2_description.urdf \
   vendor/ai_worker/ffw_description/urdf/ffw_bg2_rev4_follower/ffw_bg2_follower.urdf
