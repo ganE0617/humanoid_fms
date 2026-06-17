@@ -3,8 +3,8 @@
   "label": "Unitree",
   "description": "Initial integration target for local teleop testing.",
   "urdf": {
-    "source": "configurable",
-    "path": "",
+    "source": "unitreerobotics/unitree_ros",
+    "path": "vendor/unitree_ros/robots/g1_description/g1_29dof.urdf",
     "rootFrame": "base_link"
   },
   "topics": {
@@ -23,4 +23,3 @@
     "aux_4"
   ]
 }
-

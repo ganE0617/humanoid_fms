@@ -1,0 +1,30 @@
+services:
+  humanoid-fms:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: humanoid-fms:local
+    container_name: humanoid-fms
+    network_mode: host
+    pid: host
+    ipc: host
+    environment:
+      FMS_HOST: "127.0.0.1"
+      FMS_PORT: "8787"
+      FMS_ENABLE_ROS: "1"
+      FMS_ROBOT: "unitree"
+      ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-0}"
+      RMW_IMPLEMENTATION: "${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
+    volumes:
+      - ./config:/app/config:ro
+      - ./web:/app/web:ro
+      - ./vendor:/app/vendor:ro
+      - ./logs:/app/logs
+      - /dev:/dev
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    device_cgroup_rules:
+      - "c 81:* rwm"
+    group_add:
+      - "44"
+      - "104"
+    restart: unless-stopped

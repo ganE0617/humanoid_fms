@@ -4,7 +4,7 @@
   "description": "Future ROS 2 robot adapter target.",
   "urdf": {
     "source": "ffw_description",
-    "path": "",
+    "path": "vendor/ai_worker/ffw_description/urdf/ffw_bg2_rev4_follower/ffw_bg2_follower.urdf",
     "rootFrame": "base_link"
   },
   "topics": {
@@ -23,4 +23,3 @@
     "aux_4"
   ]
 }
-
