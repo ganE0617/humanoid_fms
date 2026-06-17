@@ -1,0 +1,26 @@
+{
+  "id": "unitree",
+  "label": "Unitree",
+  "description": "Initial integration target for local teleop testing.",
+  "urdf": {
+    "source": "configurable",
+    "path": "",
+    "rootFrame": "base_link"
+  },
+  "topics": {
+    "jointStates": "/joint_states",
+    "tf": "/tf",
+    "tfStatic": "/tf_static",
+    "odom": "/odom",
+    "cmdVel": "/cmd_vel",
+    "pointCloud": "/camera/depth/color/points",
+    "depthImage": "/camera/depth/image_rect_raw"
+  },
+  "cameraSlots": [
+    "logitech_front",
+    "logitech_rear",
+    "realsense_rgb",
+    "aux_4"
+  ]
+}
+

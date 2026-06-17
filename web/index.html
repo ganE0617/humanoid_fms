@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Humanoid FMS</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="mark"></div>
+          <div>
+            <h1>Humanoid FMS</h1>
+            <p>Local teleop console</p>
+          </div>
+        </div>
+        <div class="connection-strip">
+          <span id="clock">--:--:--</span>
+          <span class="pill good" id="runtime-pill">localhost</span>
+          <span class="pill" id="robot-pill">Unitree</span>
+          <button id="refresh-btn" class="small-button">Refresh</button>
+        </div>
+      </header>
+
+      <section class="workspace">
+        <aside class="left-rail">
+          <section class="panel robot-panel">
+            <div class="panel-title">
+              <span>Robot Adapter</span>
+              <strong id="adapter-state">READY</strong>
+            </div>
+            <label class="field-label" for="robot-select">Target</label>
+            <select id="robot-select"></select>
+            <div id="topic-map" class="topic-map"></div>
+          </section>
+
+          <section class="panel teleop-panel">
+            <div class="panel-title">
+              <span>Teleop Gate</span>
+              <strong id="teleop-state">LOCKED</strong>
+            </div>
+            <button class="arm-button" id="arm-button">Hold To Arm</button>
+            <div class="drive-pad" aria-label="Drive preview">
+              <button data-drive="forward">W</button>
+              <button data-drive="left">A</button>
+              <button data-drive="stop">STOP</button>
+              <button data-drive="right">D</button>
+              <button data-drive="back">S</button>
+            </div>
+            <div class="meters">
+              <div><span>linear</span><b id="linear-meter">0.00</b></div>
+              <div><span>angular</span><b id="angular-meter">0.00</b></div>
+            </div>
+          </section>
+        </aside>
+
+        <section class="panel camera-panel">
+          <div class="panel-title">
+            <span>Camera Streams</span>
+            <strong id="camera-summary">0/4</strong>
+          </div>
+          <div class="camera-grid" id="camera-grid"></div>
+        </section>
+
+        <section class="panel scene-panel">
+          <div class="panel-title">
+            <span>Third Person View</span>
+            <strong>URDF/TF READY</strong>
+          </div>
+          <canvas id="scene-canvas" width="960" height="720"></canvas>
+          <div class="scene-overlay">
+            <span>base_link</span>
+            <span>camera frustum</span>
+            <span>depth objects</span>
+          </div>
+        </section>
+
+        <aside class="panel status-panel">
+          <div class="panel-title">
+            <span>Status</span>
+            <strong id="status-age">--</strong>
+          </div>
+          <div class="tabs">
+            <button class="tab active" data-tab="cameras">Cameras</button>
+            <button class="tab" data-tab="ros">ROS 2</button>
+            <button class="tab" data-tab="docker">Docker</button>
+          </div>
+          <div class="status-body">
+            <div class="tab-view active" id="tab-cameras"></div>
+            <div class="tab-view" id="tab-ros"></div>
+            <div class="tab-view" id="tab-docker"></div>
+          </div>
+        </aside>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
+

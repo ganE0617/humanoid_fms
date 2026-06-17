@@ -1,0 +1,42 @@
+[
+  {
+    "id": "logitech_front",
+    "label": "Logitech C922 A",
+    "role": "front",
+    "device": "/dev/logitech1_camera",
+    "captureCandidates": ["/dev/logitech1_camera", "/dev/video0"],
+    "resolution": [640, 360],
+    "fps": 15,
+    "fov": 78
+  },
+  {
+    "id": "logitech_rear",
+    "label": "Logitech C922 B",
+    "role": "rear",
+    "device": "/dev/logitech2_camera",
+    "captureCandidates": ["/dev/logitech2_camera", "/dev/video3"],
+    "resolution": [640, 360],
+    "fps": 15,
+    "fov": 78
+  },
+  {
+    "id": "realsense_rgb",
+    "label": "RealSense D435i",
+    "role": "depth-rgb",
+    "device": "/dev/realsense_camera",
+    "captureCandidates": ["/dev/realsense_camera", "/dev/video6", "/dev/video8"],
+    "resolution": [640, 360],
+    "fps": 15,
+    "fov": 87
+  },
+  {
+    "id": "aux_4",
+    "label": "Camera 4",
+    "role": "reserved",
+    "device": "/dev/insta360_camera",
+    "captureCandidates": ["/dev/insta360_camera"],
+    "resolution": [640, 360],
+    "fps": 15,
+    "fov": 72
+  }
+]
