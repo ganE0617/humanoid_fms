@@ -29,6 +29,7 @@ const state = {
     depthPoints: null,
     depthSurface: null,
     depthFrustum: null,
+    depthObjectMarkers: null,
     controls: {
       target: new THREE.Vector3(0, 0.45, 0),
       distance: 3.2,
@@ -233,8 +234,13 @@ async function refreshDepthState() {
     updateDepthGeometry();
     renderDepthLabel();
   } catch (error) {
-    state.depthState = { source: "offline", points: [], config: {} };
-    setText("#scene-depth", "depth offline");
+    if (state.depthState?.lastDepthTime) {
+      const age = Math.max(0, Date.now() / 1000 - state.depthState.lastDepthTime).toFixed(1);
+      setText("#scene-depth", `holding depth ${age}s`);
+      return;
+    }
+    state.depthState = { source: "offline", points: [], objects: [], config: {} };
+    setText("#scene-depth", "depth waiting");
   }
 }
 
@@ -962,6 +968,9 @@ function initMeshViewer() {
   const depthFrustum = new THREE.LineSegments(frustumGeometry, frustumMaterial);
   depthFrustum.frustumCulled = false;
   depthGroup.add(depthFrustum);
+  const depthObjectMarkers = new THREE.Group();
+  depthObjectMarkers.frustumCulled = false;
+  depthGroup.add(depthObjectMarkers);
   root.add(depthGroup);
 
   state.mesh.renderer = renderer;
@@ -972,6 +981,7 @@ function initMeshViewer() {
   state.mesh.depthPoints = depthPoints;
   state.mesh.depthSurface = depthSurface;
   state.mesh.depthFrustum = depthFrustum;
+  state.mesh.depthObjectMarkers = depthObjectMarkers;
   updateOrbitCamera();
   bindSceneControls(canvas);
   resizeRenderer();
@@ -1127,6 +1137,14 @@ function clearRobotMeshes() {
   state.mesh.links.clear();
 }
 
+function disposeRuntimeObject(object) {
+  object.traverse((child) => {
+    if (child.geometry) child.geometry.dispose();
+    const materials = Array.isArray(child.material) ? child.material : [child.material];
+    materials.filter(Boolean).forEach((material) => material.dispose?.());
+  });
+}
+
 function materialForLink(linkName) {
   const color =
     linkName.includes("left") || linkName.includes("_L") ? 0x9fc8ff :
@@ -1201,11 +1219,47 @@ function depthColor(depth, near, far) {
   return [0.35, 0.7 - (t - 0.72) * 0.55, 1.0];
 }
 
+function objectColor(id, objects) {
+  const object = objects.find((item) => Number(item.id) === Number(id));
+  if (!object?.color) return null;
+  return object.color.map((channel) => clamp(Number(channel) / 255, 0, 1));
+}
+
+function colorForDepthPoint(point, near, far, objects) {
+  const objectId = Number(point?.[3] ?? -1);
+  const clusterColor = objectId >= 0 ? objectColor(objectId, objects) : null;
+  if (clusterColor) return clusterColor;
+  const px = Number(point?.[0] || 0);
+  const py = Number(point?.[1] || 0);
+  const pz = Number(point?.[2] || 0);
+  return depthColor(Math.hypot(px, py, pz), near, far);
+}
+
+function bboxLinePositions(min, max) {
+  const [x0, y0, z0] = min;
+  const [x1, y1, z1] = max;
+  return [
+    x0, y0, z0, x1, y0, z0,
+    x1, y0, z0, x1, y1, z0,
+    x1, y1, z0, x0, y1, z0,
+    x0, y1, z0, x0, y0, z0,
+    x0, y0, z1, x1, y0, z1,
+    x1, y0, z1, x1, y1, z1,
+    x1, y1, z1, x0, y1, z1,
+    x0, y1, z1, x0, y0, z1,
+    x0, y0, z0, x0, y0, z1,
+    x1, y0, z0, x1, y0, z1,
+    x1, y1, z0, x1, y1, z1,
+    x0, y1, z0, x0, y1, z1,
+  ];
+}
+
 function updateDepthGeometry() {
-  const { depthPoints, depthSurface, depthFrustum } = state.mesh;
-  if (!depthPoints || !depthSurface || !depthFrustum) return;
+  const { depthPoints, depthSurface, depthFrustum, depthObjectMarkers } = state.mesh;
+  if (!depthPoints || !depthSurface || !depthFrustum || !depthObjectMarkers) return;
   const depth = state.depthState || {};
   const config = depth.config || state.config?.robots?.[state.robotId]?.depthSensor || {};
+  const objects = Array.isArray(depth.objects) ? depth.objects : [];
   const near = Number(config.nearMeters || 0.18);
   const far = Number(config.focusFarMeters || config.farMeters || 1.05);
   const hFov = THREE.MathUtils.degToRad(Number(config.horizontalFovDeg || 87));
@@ -1247,7 +1301,7 @@ function updateDepthGeometry() {
     if (![px, py, pz].every(Number.isFinite)) return;
     vertexIndex[index] = surfacePositions.length / 3;
     surfacePositions.push(px, py, pz);
-    const color = depthColor(Math.hypot(px, py, pz), near, far);
+    const color = colorForDepthPoint(point, near, far, objects);
     surfaceColors.push(color[0], color[1], color[2]);
   });
   const indices = [];
@@ -1308,7 +1362,7 @@ function updateDepthGeometry() {
     positions[index * 3] = px;
     positions[index * 3 + 1] = py;
     positions[index * 3 + 2] = pz;
-    const color = depthColor(Math.hypot(px, py, pz), near, far);
+    const color = colorForDepthPoint(point, near, far, objects);
     colors[index * 3] = color[0];
     colors[index * 3 + 1] = color[1];
     colors[index * 3 + 2] = color[2];
@@ -1316,6 +1370,45 @@ function updateDepthGeometry() {
   depthPoints.geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
   depthPoints.geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
   depthPoints.geometry.computeBoundingSphere();
+
+  [...depthObjectMarkers.children].forEach((child) => {
+    depthObjectMarkers.remove(child);
+    disposeRuntimeObject(child);
+  });
+  objects.forEach((object) => {
+    const color = objectColor(object.id, objects) || [1, 1, 1];
+    const lineMaterial = new THREE.LineBasicMaterial({
+      color: new THREE.Color(color[0], color[1], color[2]),
+      transparent: true,
+      opacity: 0.95,
+      depthTest: false,
+    });
+    if (Array.isArray(object.bboxMin) && Array.isArray(object.bboxMax)) {
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.Float32BufferAttribute(bboxLinePositions(object.bboxMin, object.bboxMax), 3));
+      const box = new THREE.LineSegments(geometry, lineMaterial);
+      box.renderOrder = 8;
+      depthObjectMarkers.add(box);
+    }
+    if (Array.isArray(object.centroid)) {
+      const radius = Math.max(0.018, Math.min(0.045, Number(object.distanceMeters || 0.4) * 0.035));
+      const marker = new THREE.Mesh(
+        new THREE.SphereGeometry(radius, 16, 10),
+        new THREE.MeshBasicMaterial({ color: new THREE.Color(color[0], color[1], color[2]), depthTest: false }),
+      );
+      marker.position.set(Number(object.centroid[0]), Number(object.centroid[1]), Number(object.centroid[2]));
+      marker.renderOrder = 9;
+      depthObjectMarkers.add(marker);
+    }
+  });
+
+  const primary = objects[0];
+  if (primary) {
+    const size = Array.isArray(primary.size) ? primary.size.map((value) => Number(value).toFixed(2)).join("x") : "";
+    setText("#scene-objects", `${objects.length} objects / ${primary.label} ${Number(primary.distanceMeters || 0).toFixed(2)}m ${size}m`);
+  } else {
+    setText("#scene-objects", "0 objects");
+  }
 }
 
 function updateDepthPose() {

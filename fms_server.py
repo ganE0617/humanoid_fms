@@ -291,7 +291,11 @@ done
     return access
 
 
-def depth_points_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[list[list[float]], float, dict[str, Any]]:
+def depth_points_from_z16(
+    frame: np.ndarray,
+    config: dict[str, Any],
+    label_map: np.ndarray | None = None,
+) -> tuple[list[list[float]], float, dict[str, Any]]:
     height, width = frame.shape[:2]
     max_points = max(100, min(80000, int(config.get("maxPoints", 8000))))
     scale = float(config.get("depthScaleMeters", 0.001))
@@ -307,19 +311,45 @@ def depth_points_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[li
 
     depth_m = frame.astype(np.float32) * scale
     valid = (frame > 0) & (frame < 65535) & (depth_m >= near) & (depth_m <= point_far)
-    vs, us = np.nonzero(valid)
-    count = int(vs.size)
-    if count > max_points:
-        keep = np.linspace(0, count - 1, max_points, dtype=np.int64)
-        vs = vs[keep]
-        us = us[keep]
+    if label_map is not None and label_map.shape == frame.shape and np.any(label_map >= 0):
+        object_vs, object_us = np.nonzero(valid & (label_map >= 0))
+        background_vs, background_us = np.nonzero(valid & (label_map < 0))
+        object_budget = min(object_vs.size, int(max_points * 0.84))
+        background_budget = max(0, max_points - object_budget)
+        if object_vs.size > object_budget and object_budget > 0:
+            keep = np.linspace(0, object_vs.size - 1, object_budget, dtype=np.int64)
+            object_vs = object_vs[keep]
+            object_us = object_us[keep]
+        if background_vs.size > background_budget and background_budget > 0:
+            keep = np.linspace(0, background_vs.size - 1, background_budget, dtype=np.int64)
+            background_vs = background_vs[keep]
+            background_us = background_us[keep]
+        elif background_budget <= 0:
+            background_vs = np.array([], dtype=np.int64)
+            background_us = np.array([], dtype=np.int64)
+        vs = np.concatenate((object_vs, background_vs))
+        us = np.concatenate((object_us, background_us))
+    else:
+        vs, us = np.nonzero(valid)
+        count = int(vs.size)
+        if count > max_points:
+            keep = np.linspace(0, count - 1, max_points, dtype=np.int64)
+            vs = vs[keep]
+            us = us[keep]
 
     z = depth_m[vs, us].astype(np.float32) if vs.size else np.array([], dtype=np.float32)
     x = ((us.astype(np.float32) - cx) * z / fx) if vs.size else z
     y = ((vs.astype(np.float32) - cy) * z / fy) if vs.size else z
     distances = np.sqrt(x * x + y * y + z * z) if vs.size else np.array([], dtype=np.float32)
     nearest = float(np.min(distances)) if distances.size else 0.0
-    points = np.column_stack((x, y, z)).round(4).astype(float).tolist() if vs.size else []
+    if vs.size:
+        columns = [x, y, z]
+        if label_map is not None and label_map.shape == frame.shape:
+            labels = label_map[vs, us].astype(np.float32)
+            columns.append(labels)
+        points = np.column_stack(columns).round(4).astype(float).tolist()
+    else:
+        points = []
 
     step = max(2, min(32, int(config.get("surfaceStep", 8))))
     rows = int(np.ceil(height / step))
@@ -341,7 +371,16 @@ def depth_points_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[li
             vc = v0 + (v1 - v0 - 1) * 0.5
             xc = (uc - cx) * zc / fx
             yc = (vc - cy) * zc / fy
-            surface_points.append([round(float(xc), 4), round(float(yc), 4), round(float(zc), 4)])
+            point = [round(float(xc), 4), round(float(yc), 4), round(float(zc), 4)]
+            if label_map is not None and label_map.shape == frame.shape:
+                patch_labels = label_map[v0:v1, u0:u1][patch_valid]
+                object_labels = patch_labels[patch_labels >= 0]
+                if object_labels.size:
+                    counts = np.bincount(object_labels.astype(np.int32))
+                    point.append(float(np.argmax(counts)))
+                else:
+                    point.append(-1.0)
+            surface_points.append(point)
 
     surface = {
         "width": cols,
@@ -350,6 +389,184 @@ def depth_points_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[li
         "maxDepthDelta": float(config.get("surfaceMaxDepthDelta", 0.18)),
     }
     return points, nearest, surface
+
+
+def segment_depth_objects_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[list[dict[str, Any]], np.ndarray, dict[str, Any]]:
+    height, width = frame.shape[:2]
+    label_map = np.full((height, width), -1, dtype=np.int16)
+    if not bool(config.get("objectSegmentation", True)):
+        return [], label_map, {"enabled": False}
+
+    scale = float(config.get("depthScaleMeters", 0.001))
+    near = float(config.get("nearMeters", 0.18))
+    far = min(float(config.get("farMeters", 3.0)), float(config.get("focusFarMeters", 1.05)))
+    hfov = np.deg2rad(float(config.get("horizontalFovDeg", 87)))
+    vfov = np.deg2rad(float(config.get("verticalFovDeg", 58)))
+    fx = width / (2.0 * np.tan(hfov / 2.0))
+    fy = height / (2.0 * np.tan(vfov / 2.0))
+    cx = (width - 1) / 2.0
+    cy = (height - 1) / 2.0
+
+    depth_m = frame.astype(np.float32) * scale
+    valid = (frame > 0) & (frame < 65535) & (depth_m >= near) & (depth_m <= far)
+    us_grid = np.arange(width, dtype=np.float32)[None, :]
+    vs_grid = np.arange(height, dtype=np.float32)[:, None]
+    x_m = (us_grid - cx) * depth_m / fx
+    y_m = (vs_grid - cy) * depth_m / fy
+    z_m = depth_m
+
+    roi_x = config.get("roiXMeters", [-0.55, 0.55])
+    roi_y = config.get("roiYMeters", [-0.45, 0.45])
+    roi_mask = (
+        valid
+        & (x_m >= float(roi_x[0]))
+        & (x_m <= float(roi_x[1]))
+        & (y_m >= float(roi_y[0]))
+        & (y_m <= float(roi_y[1]))
+    )
+    roi_count = int(np.count_nonzero(roi_mask))
+    object_mask = roi_mask.copy()
+
+    plane_inliers = np.zeros_like(object_mask, dtype=bool)
+    plane_stats: dict[str, Any] = {"removed": 0, "model": []}
+    if bool(config.get("planeRemoval", True)) and roi_count >= int(config.get("planeMinInliers", 1600)):
+        ys, xs = np.nonzero(roi_mask)
+        sample_cap = min(int(config.get("planeSamplePoints", 6500)), ys.size)
+        if sample_cap >= 3:
+            take = np.linspace(0, ys.size - 1, sample_cap, dtype=np.int64)
+            sample_points = np.column_stack((x_m[ys[take], xs[take]], y_m[ys[take], xs[take]], z_m[ys[take], xs[take]])).astype(np.float32)
+            rng = np.random.default_rng(17)
+            best_inliers = np.zeros(sample_points.shape[0], dtype=bool)
+            best_normal: np.ndarray | None = None
+            best_d = 0.0
+            threshold = float(config.get("planeDistanceThreshold", 0.018))
+            iterations = int(config.get("planeIterations", 90))
+            for _ in range(max(1, iterations)):
+                ids = rng.choice(sample_points.shape[0], 3, replace=False)
+                p0, p1, p2 = sample_points[ids]
+                normal = np.cross(p1 - p0, p2 - p0)
+                norm = float(np.linalg.norm(normal))
+                if norm < 1e-5:
+                    continue
+                normal = normal / norm
+                d = -float(np.dot(normal, p0))
+                distances = np.abs(sample_points @ normal + d)
+                inliers = distances <= threshold
+                if int(np.count_nonzero(inliers)) > int(np.count_nonzero(best_inliers)):
+                    best_inliers = inliers
+                    best_normal = normal
+                    best_d = d
+            sample_inliers = int(np.count_nonzero(best_inliers))
+            min_inliers = int(config.get("planeMinInliers", 1600))
+            plane_stats = {"removed": 0, "sampleInliers": sample_inliers, "model": []}
+            if best_normal is not None and sample_inliers >= min_inliers:
+                distances_full = np.abs(x_m * best_normal[0] + y_m * best_normal[1] + z_m * best_normal[2] + best_d)
+                plane_inliers = roi_mask & (distances_full <= threshold)
+                object_mask &= ~plane_inliers
+                plane_stats = {
+                    "removed": int(np.count_nonzero(plane_inliers)),
+                    "sampleInliers": sample_inliers,
+                    "model": [round(float(best_normal[0]), 4), round(float(best_normal[1]), 4), round(float(best_normal[2]), 4), round(float(best_d), 4)],
+                }
+
+    kernel = np.ones((3, 3), np.uint8)
+    mask = object_mask.astype(np.uint8) * 255
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=int(config.get("clusterCloseIterations", 2)))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=int(config.get("clusterOpenIterations", 1)))
+    labels_count, labels, stats, centroids_px = cv2.connectedComponentsWithStats(mask, 8)
+
+    palette = [
+        [255, 190, 94],
+        [98, 213, 255],
+        [94, 228, 147],
+        [255, 107, 114],
+        [134, 168, 255],
+        [224, 144, 255],
+        [255, 229, 125],
+        [118, 248, 214],
+    ]
+    min_pixels = int(config.get("clusterMinPixels", 140))
+    max_pixels = int(config.get("clusterMaxPixels", 90000))
+    max_objects = int(config.get("clusterMaxObjects", 8))
+    large_border_ratio = float(config.get("clusterDropLargeBorderRatio", 0.28))
+    candidates: list[dict[str, Any]] = []
+    for label in range(1, labels_count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < min_pixels or area > max_pixels:
+            continue
+        x0 = int(stats[label, cv2.CC_STAT_LEFT])
+        y0 = int(stats[label, cv2.CC_STAT_TOP])
+        ww = int(stats[label, cv2.CC_STAT_WIDTH])
+        hh = int(stats[label, cv2.CC_STAT_HEIGHT])
+        touches_border = x0 <= 1 or y0 <= 1 or x0 + ww >= width - 2 or y0 + hh >= height - 2
+        if bool(config.get("clusterDropBorder", True)) and touches_border:
+            continue
+        if touches_border and area > int(frame.size * large_border_ratio):
+            continue
+        component = (labels == label) & object_mask
+        true_area = int(np.count_nonzero(component))
+        if true_area < min_pixels:
+            continue
+        xs3 = x_m[component]
+        ys3 = y_m[component]
+        zs3 = z_m[component]
+        if zs3.size < min_pixels:
+            continue
+        points3 = np.column_stack((xs3, ys3, zs3))
+        lo = np.percentile(points3, 2, axis=0)
+        hi = np.percentile(points3, 98, axis=0)
+        keep = np.all((points3 >= lo) & (points3 <= hi), axis=1)
+        trimmed = points3[keep] if np.count_nonzero(keep) >= max(20, min_pixels // 4) else points3
+        centroid = np.median(trimmed, axis=0)
+        bbox_min = np.percentile(trimmed, 2, axis=0)
+        bbox_max = np.percentile(trimmed, 98, axis=0)
+        dims = np.maximum(0.0, bbox_max - bbox_min)
+        distance = float(np.linalg.norm(centroid))
+        candidates.append(
+            {
+                "sourceLabel": label,
+                "area": area,
+                "component": component,
+                "object": {
+                    "id": 0,
+                    "label": "object",
+                    "centroid": [round(float(v), 4) for v in centroid],
+                    "bboxMin": [round(float(v), 4) for v in bbox_min],
+                    "bboxMax": [round(float(v), 4) for v in bbox_max],
+                    "size": [round(float(v), 4) for v in dims],
+                    "distanceMeters": round(distance, 3),
+                    "numPoints": int(trimmed.shape[0]),
+                    "pixelArea": true_area,
+                    "pixelBox": {
+                        "x": round(x0 / width, 4),
+                        "y": round(y0 / height, 4),
+                        "w": round(ww / width, 4),
+                        "h": round(hh / height, 4),
+                    },
+                    "color": palette[0],
+                },
+            }
+        )
+
+    candidates.sort(key=lambda item: (item["object"]["distanceMeters"], -item["area"]))
+    objects: list[dict[str, Any]] = []
+    for object_id, item in enumerate(candidates[:max_objects]):
+        color = palette[object_id % len(palette)]
+        obj = item["object"]
+        obj["id"] = object_id
+        obj["label"] = f"object_{object_id}"
+        obj["color"] = color
+        label_map[item["component"]] = object_id
+        objects.append(obj)
+
+    stats_payload = {
+        "enabled": True,
+        "roiPixels": roi_count,
+        "objectPixels": int(np.count_nonzero(label_map >= 0)),
+        "objects": len(objects),
+        "plane": plane_stats,
+    }
+    return objects, label_map, stats_payload
 
 
 def preprocess_depth_frame(
@@ -615,6 +832,7 @@ class RosMonitor:
         self.depth_frame = ""
         self.depth_points: list[list[float]] = []
         self.depth_surface: dict[str, Any] = {}
+        self.depth_objects: list[dict[str, Any]] = []
         self.depth_preview_png = b""
         self.depth_view_jpg = b""
         self.depth_assist_overlay_png = b""
@@ -659,6 +877,7 @@ class RosMonitor:
                 "lastDepthTime": self.last_depth_time,
                 "points": self.depth_points,
                 "surface": self.depth_surface,
+                "objects": self.depth_objects,
                 "stats": self.depth_stats,
                 "previewUrl": f"/api/depth-preview.png?t={int(self.last_depth_time * 1000)}" if self.depth_preview_png else "",
                 "depthViewUrl": f"/api/depth-view.jpg?t={int(self.last_depth_time * 1000)}" if self.depth_view_jpg else "",
@@ -743,17 +962,19 @@ class RosMonitor:
                     depth,
                     self.depth_temporal_m,
                 )
-                points, nearest, surface = depth_points_from_z16(processed_frame, depth)
+                objects, label_map, segment_stats = segment_depth_objects_from_z16(processed_frame, depth)
+                points, nearest, surface = depth_points_from_z16(processed_frame, depth, label_map)
                 preview_png, depth_stats = depth_preview_from_z16(processed_frame, depth)
                 depth_view_jpg = depth_view_from_z16(processed_frame, depth)
                 assist_overlay_png, assist_stats = depth_assist_overlay_from_z16(processed_frame, depth)
                 with self.lock:
                     self.depth_points = points
                     self.depth_surface = surface
+                    self.depth_objects = objects
                     self.depth_preview_png = preview_png
                     self.depth_view_jpg = depth_view_jpg
                     self.depth_assist_overlay_png = assist_overlay_png
-                    self.depth_stats = {**depth_stats, **assist_stats, "preprocess": preprocess_stats}
+                    self.depth_stats = {**depth_stats, **assist_stats, "preprocess": preprocess_stats, "segmentation": segment_stats}
                     self.depth_frame = depth.get("fallbackOpticalFrame", "camera_depth_optical_frame")
                     self.last_depth_time = time.time()
                     self.depth_total = int(frame.size)
