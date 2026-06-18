@@ -385,12 +385,144 @@ select {
   background: #030609;
 }
 
-.camera-card img {
+.camera-card img.camera-stream {
   width: 100%;
   height: 100%;
   object-fit: contain;
   display: block;
   background: #030609;
+}
+
+.camera-card img.camera-stream.hidden {
+  display: none;
+}
+
+.depth-assist-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.grasp-distance-pill {
+  position: absolute;
+  left: 50%;
+  top: 53%;
+  min-width: 92px;
+  transform: translate(-50%, 18px);
+  display: grid;
+  justify-items: center;
+  gap: 1px;
+  padding: 5px 9px;
+  border: 1px solid rgba(97, 213, 255, 0.56);
+  border-radius: 7px;
+  background: rgba(2, 6, 10, 0.82);
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.32);
+  z-index: 4;
+}
+
+.grasp-distance-pill span {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.grasp-distance-pill b {
+  color: var(--cyan);
+  font-size: 17px;
+  line-height: 1;
+}
+
+.grasp-assist {
+  position: absolute;
+  right: 8px;
+  top: 42px;
+  width: min(230px, calc(100% - 16px));
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid rgba(97, 213, 255, 0.35);
+  border-radius: 7px;
+  background: rgba(3, 7, 10, 0.78);
+  backdrop-filter: blur(6px);
+  z-index: 4;
+}
+
+.grasp-assist[data-guidance="grasp-range"] {
+  border-color: rgba(94, 228, 147, 0.58);
+}
+
+.grasp-assist[data-guidance="approach"] {
+  border-color: rgba(255, 191, 94, 0.6);
+}
+
+.grasp-assist[data-guidance="back-up"] {
+  border-color: rgba(255, 107, 114, 0.62);
+}
+
+.grasp-assist-head,
+.grasp-metrics {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 7px;
+}
+
+.grasp-assist-head span,
+.grasp-metrics span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.grasp-assist-head strong,
+.grasp-metrics b {
+  color: var(--cyan);
+  font-size: 10px;
+}
+
+.grasp-assist[data-guidance="grasp-range"] .grasp-assist-head strong {
+  color: var(--green);
+}
+
+.grasp-assist[data-guidance="approach"] .grasp-assist-head strong {
+  color: var(--amber);
+}
+
+.grasp-assist[data-guidance="back-up"] .grasp-assist-head strong {
+  color: var(--red);
+}
+
+.grasp-range {
+  position: relative;
+  height: 9px;
+}
+
+.grasp-range i {
+  position: absolute;
+  inset: 2px 0;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--red), var(--green) 38%, var(--green) 52%, var(--amber));
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+}
+
+.grasp-range em {
+  position: absolute;
+  top: 0;
+  width: 3px;
+  height: 9px;
+  border-radius: 999px;
+  background: #ffffff;
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.55);
+}
+
+.is-depth-camera .camera-head,
+.is-depth-camera .camera-foot {
+  z-index: 5;
 }
 
 .camera-empty {
@@ -481,7 +613,7 @@ select {
   position: absolute;
   top: 45px;
   left: 10px;
-  width: min(290px, calc(100% - 290px));
+  width: min(220px, calc(100% - 290px));
   display: grid;
   gap: 7px;
   padding: 9px;
@@ -491,6 +623,11 @@ select {
   box-shadow: 0 12px 26px rgba(0, 0, 0, 0.26);
   backdrop-filter: blur(8px);
   z-index: 3;
+}
+
+.depth-hud .depth-preview,
+.depth-hud .depth-scale {
+  display: none;
 }
 
 .depth-hud-head,

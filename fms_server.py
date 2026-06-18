@@ -398,6 +398,97 @@ def depth_preview_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[b
     }
 
 
+def depth_assist_overlay_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
+    scale = float(config.get("depthScaleMeters", 0.001))
+    near = float(config.get("nearMeters", 0.18))
+    far = float(config.get("farMeters", 3.0))
+    desired = float(config.get("assistDesiredMeters", 0.45))
+    tolerance = float(config.get("assistToleranceMeters", 0.12))
+    depth_m = frame.astype(np.float32) * scale
+    height, width = frame.shape[:2]
+
+    target_aspect = float(config.get("assistAspect", 16 / 9))
+    crop_height = min(height, int(round(width / target_aspect)))
+    crop_y = max(0, (height - crop_height) // 2)
+    crop = depth_m[crop_y:crop_y + crop_height, :]
+    crop_raw = frame[crop_y:crop_y + crop_height, :]
+    valid = (crop_raw > 0) & (crop_raw < 65535) & (crop >= near) & (crop <= far)
+    ch, cw = crop.shape[:2]
+
+    roi_w = int(cw * float(config.get("assistRoiWidth", 0.24)))
+    roi_h = int(ch * float(config.get("assistRoiHeight", 0.34)))
+    roi_cx = int(cw * float(config.get("assistCenterX", 0.5)))
+    roi_cy = int(ch * float(config.get("assistCenterY", 0.52)))
+    x0 = max(0, roi_cx - roi_w // 2)
+    x1 = min(cw, roi_cx + roi_w // 2)
+    y0 = max(0, roi_cy - roi_h // 2)
+    y1 = min(ch, roi_cy + roi_h // 2)
+    roi_depth = crop[y0:y1, x0:x1]
+    roi_valid = valid[y0:y1, x0:x1]
+    roi_values = roi_depth[roi_valid]
+
+    target = float(np.median(roi_values)) if roi_values.size else 0.0
+    roi_nearest = float(np.min(roi_values)) if roi_values.size else 0.0
+    roi_coverage = float(np.count_nonzero(roi_valid)) / float(roi_valid.size or 1)
+    all_values = crop[valid]
+    nearest = float(np.min(all_values)) if all_values.size else 0.0
+
+    if not target:
+        guidance = "NO DEPTH"
+        delta = 0.0
+    else:
+        delta = target - desired
+        if target < desired - tolerance:
+            guidance = "BACK UP"
+        elif target > desired + tolerance:
+            guidance = "APPROACH"
+        else:
+            guidance = "GRASP RANGE"
+
+    overlay = np.zeros((ch, cw, 4), dtype=np.uint8)
+    if target:
+        band = max(0.06, min(0.22, target * 0.08))
+        pad_x = int(roi_w * float(config.get("assistOverlayPadX", 1.25)))
+        pad_y = int(roi_h * float(config.get("assistOverlayPadY", 0.95)))
+        sx0 = max(0, x0 - pad_x)
+        sx1 = min(cw, x1 + pad_x)
+        sy0 = max(0, y0 - pad_y)
+        sy1 = min(ch, y1 + pad_y)
+        scope = np.zeros_like(valid, dtype=bool)
+        scope[sy0:sy1, sx0:sx1] = True
+        target_surface = scope & valid & (np.abs(crop - target) <= band)
+        too_close = roi_valid & (roi_depth < max(near, target - band * 1.8))
+        overlay[target_surface] = (255, 226, 105, 105)
+        roi_overlay = overlay[y0:y1, x0:x1]
+        roi_overlay[too_close] = (72, 88, 255, 72)
+
+    cv2.rectangle(overlay, (x0, y0), (x1, y1), (255, 255, 255, 235), 2, cv2.LINE_AA)
+    cv2.line(overlay, (roi_cx - 22, roi_cy), (roi_cx + 22, roi_cy), (255, 255, 255, 235), 2, cv2.LINE_AA)
+    cv2.line(overlay, (roi_cx, roi_cy - 22), (roi_cx, roi_cy + 22), (255, 255, 255, 235), 2, cv2.LINE_AA)
+    cv2.circle(overlay, (roi_cx, roi_cy), 5, (255, 255, 255, 235), 1, cv2.LINE_AA)
+
+    target_width, target_height = config.get("assistOverlayResolution", [640, 360])
+    overlay = cv2.resize(overlay, (int(target_width), int(target_height)), interpolation=cv2.INTER_AREA)
+    ok, encoded = cv2.imencode(".png", overlay, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+    if not ok:
+        return b"", {}
+    return encoded.tobytes(), {
+        "targetMeters": round(target, 3) if target else 0.0,
+        "targetNearestMeters": round(roi_nearest, 3) if roi_nearest else 0.0,
+        "targetCoverage": round(roi_coverage, 3),
+        "globalNearestMeters": round(nearest, 3) if nearest else 0.0,
+        "desiredMeters": desired,
+        "deltaMeters": round(delta, 3) if target else 0.0,
+        "guidance": guidance,
+        "targetRoi": {
+            "x": round(x0 / cw, 4),
+            "y": round(y0 / ch, 4),
+            "w": round((x1 - x0) / cw, 4),
+            "h": round((y1 - y0) / ch, 4),
+        },
+    }
+
+
 class RosMonitor:
     def __init__(self, robot_id: str):
         self.robot_id = robot_id
@@ -413,6 +504,7 @@ class RosMonitor:
         self.depth_points: list[list[float]] = []
         self.depth_surface: dict[str, Any] = {}
         self.depth_preview_png = b""
+        self.depth_assist_overlay_png = b""
         self.depth_stats: dict[str, Any] = {}
         self.depth_error = ""
         self.depth_total = 0
@@ -455,6 +547,7 @@ class RosMonitor:
                 "surface": self.depth_surface,
                 "stats": self.depth_stats,
                 "previewUrl": f"/api/depth-preview.png?t={int(self.last_depth_time * 1000)}" if self.depth_preview_png else "",
+                "assistOverlayUrl": f"/api/depth-assist-overlay.png?t={int(self.last_depth_time * 1000)}" if self.depth_assist_overlay_png else "",
                 "total": self.depth_total,
                 "nearestMeters": self.depth_nearest,
                 "dataSource": self.depth_source,
@@ -532,11 +625,13 @@ class RosMonitor:
 
                 points, nearest, surface = depth_points_from_z16(frame, depth)
                 preview_png, depth_stats = depth_preview_from_z16(frame, depth)
+                assist_overlay_png, assist_stats = depth_assist_overlay_from_z16(frame, depth)
                 with self.lock:
                     self.depth_points = points
                     self.depth_surface = surface
                     self.depth_preview_png = preview_png
-                    self.depth_stats = depth_stats
+                    self.depth_assist_overlay_png = assist_overlay_png
+                    self.depth_stats = {**depth_stats, **assist_stats}
                     self.depth_frame = depth.get("fallbackOpticalFrame", "camera_depth_optical_frame")
                     self.last_depth_time = time.time()
                     self.depth_total = int(frame.size)
@@ -875,6 +970,17 @@ def get_depth_preview() -> Response:
         content = _ROS_MONITOR.depth_preview_png
     if not content:
         raise HTTPException(status_code=404, detail="depth preview unavailable")
+    return Response(content=content, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/depth-assist-overlay.png")
+def get_depth_assist_overlay() -> Response:
+    if _ROS_MONITOR is None:
+        raise HTTPException(status_code=404, detail="depth monitor not started")
+    with _ROS_MONITOR.lock:
+        content = _ROS_MONITOR.depth_assist_overlay_png
+    if not content:
+        raise HTTPException(status_code=404, detail="depth assist overlay unavailable")
     return Response(content=content, media_type="image/png", headers={"Cache-Control": "no-store"})
 
 

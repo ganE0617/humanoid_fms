@@ -278,6 +278,48 @@ function renderDepthHud(depth) {
   setText("#depth-coverage", Number.isFinite(Number(stats.coverage)) ? `${Math.round(Number(stats.coverage) * 100)}%` : "--");
   setText("#depth-near", formatMeters(stats.nearMeters || config.nearMeters));
   setText("#depth-far", formatMeters(stats.farMeters || config.farMeters));
+  renderDepthAssist(depth);
+}
+
+function formatSignedMeters(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number) || number === 0) return "0.00 m";
+  return `${number > 0 ? "+" : ""}${number.toFixed(2)} m`;
+}
+
+function updateImageSource(image, rawUrl) {
+  if (!image || !rawUrl) return;
+  const url = rawUrl.includes("?") ? `${rawUrl}&r=${Math.floor(Date.now() / 500)}` : `${rawUrl}?r=${Math.floor(Date.now() / 500)}`;
+  if (image.dataset.src !== url) {
+    image.dataset.src = url;
+    image.src = url;
+  }
+}
+
+function renderDepthAssist(depth) {
+  const stats = depth.stats || {};
+  const target = Number(stats.targetMeters || stats.centerMeters || 0);
+  const desired = Number(stats.desiredMeters || 0.45);
+  const coverage = Number(stats.targetCoverage ?? stats.coverage ?? 0);
+  const guidance = String(stats.guidance || (target ? "DEPTH READY" : "NO DEPTH"));
+  const overlay = $("#depth-assist-overlay");
+  updateImageSource(overlay, depth.assistOverlayUrl);
+
+  setText("#grasp-distance", formatMeters(target));
+  setText("#grasp-guidance", guidance);
+  setText("#grasp-nearest", formatMeters(stats.targetNearestMeters || stats.nearestMeters));
+  setText("#grasp-confidence", Number.isFinite(coverage) ? `${Math.round(coverage * 100)}%` : "--");
+  setText("#grasp-delta", target ? formatSignedMeters(target - desired) : "--");
+
+  const panel = $(".grasp-assist");
+  if (panel) {
+    panel.dataset.guidance = guidance.toLowerCase().replaceAll(" ", "-");
+  }
+  const marker = $("#grasp-range-marker");
+  if (marker) {
+    const maxRange = Math.max(desired * 2.4, 1.2);
+    marker.style.left = `${Math.round(clamp(target / maxRange, 0, 1) * 100)}%`;
+  }
 }
 
 async function refreshMissionState() {
@@ -432,25 +474,54 @@ function renderCameraGrid() {
   const grid = $("#camera-grid");
   grid.innerHTML = state.config.cameras
     .map(
-      (cam, index) => `
-        <article class="camera-card" id="cam-${cam.id}">
+      (cam, index) => {
+        const isDepthCamera = cam.id === "realsense_rgb" || String(cam.role || "").includes("depth");
+        return `
+        <article class="camera-card ${isDepthCamera ? "is-depth-camera" : ""}" id="cam-${cam.id}">
           <div class="camera-head">
             <span class="badge">${index + 1}. ${escapeHtml(cam.label)}</span>
             <span class="badge" data-cam-status="${cam.id}">WAIT</span>
           </div>
-          <img src="/stream/${cam.id}" alt="${escapeHtml(cam.label)} stream" onerror="this.style.display='none'; this.nextElementSibling.style.display='grid';" />
+          <img class="camera-stream" src="/stream/${cam.id}" alt="${escapeHtml(cam.label)} stream" onerror="this.classList.add('hidden'); this.parentElement.querySelector('.camera-empty').style.display='grid';" />
           <div class="camera-empty" style="display:none">
             <div>
               <b>${escapeHtml(cam.role)}</b>
               <p>${escapeHtml(cam.device)}</p>
             </div>
           </div>
+          ${
+            isDepthCamera
+              ? `
+                <img id="depth-assist-overlay" class="depth-assist-overlay" alt="" />
+                <div class="grasp-distance-pill">
+                  <span>target</span>
+                  <b id="grasp-distance">-- m</b>
+                </div>
+                <div class="grasp-assist" data-guidance="no-depth">
+                  <div class="grasp-assist-head">
+                    <span>Grasp Assist</span>
+                    <strong id="grasp-guidance">NO DEPTH</strong>
+                  </div>
+                  <div class="grasp-range">
+                    <i></i>
+                    <em id="grasp-range-marker"></em>
+                  </div>
+                  <div class="grasp-metrics">
+                    <span>nearest <b id="grasp-nearest">--</b></span>
+                    <span>valid <b id="grasp-confidence">--</b></span>
+                    <span>delta <b id="grasp-delta">--</b></span>
+                  </div>
+                </div>
+              `
+              : ""
+          }
           <div class="camera-foot">
             <span class="badge">${escapeHtml(cam.device)}</span>
             <span class="badge">${cam.fov} deg</span>
           </div>
         </article>
-      `,
+      `;
+      },
     )
     .join("");
 }

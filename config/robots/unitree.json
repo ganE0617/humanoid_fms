@@ -45,7 +45,14 @@
     "farMeters": 3.0,
     "maxPoints": 10000,
     "surfaceStep": 3,
-    "surfaceMaxDepthDelta": 0.6
+    "surfaceMaxDepthDelta": 0.6,
+    "assistDesiredMeters": 0.45,
+    "assistToleranceMeters": 0.12,
+    "assistCenterX": 0.5,
+    "assistCenterY": 0.52,
+    "assistRoiWidth": 0.24,
+    "assistRoiHeight": 0.34,
+    "assistOverlayResolution": [640, 360]
   },
   "lowStateJointNames": [
     "FL_hip_joint",
