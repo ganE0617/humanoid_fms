@@ -757,6 +757,11 @@ def depth_view_from_z16(frame: np.ndarray, config: dict[str, Any]) -> bytes:
 
     target_width, target_height = config.get("depthViewResolution", [640, 360])
     view = cv2.resize(color, (int(target_width), int(target_height)), interpolation=cv2.INTER_CUBIC)
+    shift_y = int(config.get("depthViewShiftY", 0))
+    shift_x = int(config.get("depthViewShiftX", 0))
+    if shift_x or shift_y:
+        matrix = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
+        view = cv2.warpAffine(view, matrix, (int(target_width), int(target_height)), borderValue=(10, 14, 19))
     cv2.putText(view, f"{near:.2f}m", (10, int(target_height) - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (245, 250, 255), 1, cv2.LINE_AA)
     cv2.putText(view, f"{far:.2f}m", (int(target_width) - 58, int(target_height) - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (245, 250, 255), 1, cv2.LINE_AA)
     ok, encoded = cv2.imencode(".jpg", view, [int(cv2.IMWRITE_JPEG_QUALITY), 86])
