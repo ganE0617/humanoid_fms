@@ -31,12 +31,12 @@
   },
   {
     "id": "aux_4",
-    "label": "Camera 4",
-    "role": "reserved",
-    "device": "/dev/insta360_camera",
-    "captureCandidates": ["/dev/insta360_camera"],
+    "label": "RealSense Depth",
+    "role": "depth-z16",
+    "device": "/dev/video4",
+    "captureCandidates": ["/dev/video4"],
     "resolution": [640, 360],
     "fps": 15,
-    "fov": 72
+    "fov": 87
   }
 ]

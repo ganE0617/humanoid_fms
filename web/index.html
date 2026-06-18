@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Humanoid FMS</title>
-    <link rel="stylesheet" href="/styles.css?v=20260618-grasp-assist" />
+    <link rel="stylesheet" href="/styles.css?v=20260618-depth-slot" />
   </head>
   <body class="adapter-collapsed status-collapsed">
     <main class="shell">
@@ -63,6 +63,21 @@
             <span>Camera Streams</span>
             <strong id="camera-summary">0/4</strong>
           </div>
+          <div class="mission-panel" aria-label="Mission signals">
+            <div class="mission-head">
+              <span>Mission</span>
+              <strong id="mission-stage">IDLE</strong>
+            </div>
+            <div class="mission-actions">
+              <button data-mission="start">START</button>
+              <button data-mission="complete">END</button>
+              <button data-mission="ok">OK</button>
+            </div>
+            <div class="mission-state">
+              <span id="mission-topic">/fms/mission_events</span>
+              <b id="mission-last">waiting</b>
+            </div>
+          </div>
           <div class="camera-grid" id="camera-grid"></div>
         </section>
 
@@ -89,21 +104,6 @@
             <div class="depth-metrics">
               <span>nearest <b id="depth-nearest">--</b></span>
               <span>valid <b id="depth-coverage">--</b></span>
-            </div>
-          </div>
-          <div class="mission-panel" aria-label="Mission signals">
-            <div class="mission-head">
-              <span>Mission Signals</span>
-              <strong id="mission-stage">IDLE</strong>
-            </div>
-            <div class="mission-actions">
-              <button data-mission="start">START</button>
-              <button data-mission="complete">COMPLETE</button>
-              <button data-mission="ok">OK</button>
-            </div>
-            <div class="mission-state">
-              <span id="mission-topic">/fms/mission_events</span>
-              <b id="mission-last">waiting</b>
             </div>
           </div>
           <div class="scene-overlay">
@@ -141,6 +141,6 @@
         }
       }
     </script>
-    <script type="module" src="/app.js?v=20260618-grasp-assist"></script>
+    <script type="module" src="/app.js?v=20260618-depth-slot"></script>
   </body>
 </html>

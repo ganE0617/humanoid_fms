@@ -293,10 +293,11 @@ done
 
 def depth_points_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[list[list[float]], float, dict[str, Any]]:
     height, width = frame.shape[:2]
-    max_points = max(100, min(20000, int(config.get("maxPoints", 8000))))
+    max_points = max(100, min(80000, int(config.get("maxPoints", 8000))))
     scale = float(config.get("depthScaleMeters", 0.001))
     near = float(config.get("nearMeters", 0.18))
     far = float(config.get("farMeters", 3.0))
+    point_far = min(far, float(config.get("focusFarMeters", config.get("pointFarMeters", far))))
     hfov = np.deg2rad(float(config.get("horizontalFovDeg", 87)))
     vfov = np.deg2rad(float(config.get("verticalFovDeg", 58)))
     fx = width / (2.0 * np.tan(hfov / 2.0))
@@ -305,7 +306,7 @@ def depth_points_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[li
     cy = (height - 1) / 2.0
 
     depth_m = frame.astype(np.float32) * scale
-    valid = (frame > 0) & (frame < 65535) & (depth_m >= near) & (depth_m <= far)
+    valid = (frame > 0) & (frame < 65535) & (depth_m >= near) & (depth_m <= point_far)
     vs, us = np.nonzero(valid)
     count = int(vs.size)
     if count > max_points:
@@ -396,6 +397,34 @@ def depth_preview_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[b
         "nearMeters": near,
         "farMeters": far,
     }
+
+
+def depth_view_from_z16(frame: np.ndarray, config: dict[str, Any]) -> bytes:
+    scale = float(config.get("depthScaleMeters", 0.001))
+    near = float(config.get("nearMeters", 0.18))
+    far = min(float(config.get("farMeters", 3.0)), float(config.get("depthViewFarMeters", 1.4)))
+    depth_m = frame.astype(np.float32) * scale
+    valid = (frame > 0) & (frame < 65535) & (depth_m >= near) & (depth_m <= far)
+
+    height, width = frame.shape[:2]
+    target_aspect = 16 / 9
+    crop_height = min(height, int(round(width / target_aspect)))
+    crop_y = max(0, (height - crop_height) // 2)
+    depth_crop = depth_m[crop_y:crop_y + crop_height, :]
+    valid_crop = valid[crop_y:crop_y + crop_height, :]
+
+    clipped = np.clip(depth_crop, near, far)
+    inverse = ((far - clipped) / max(0.001, far - near) * 255.0).astype(np.uint8)
+    inverse = cv2.medianBlur(inverse, 3)
+    color = cv2.applyColorMap(inverse, cv2.COLORMAP_TURBO)
+    color[~valid_crop] = (10, 14, 19)
+
+    target_width, target_height = config.get("depthViewResolution", [640, 360])
+    view = cv2.resize(color, (int(target_width), int(target_height)), interpolation=cv2.INTER_CUBIC)
+    cv2.putText(view, f"{near:.2f}m", (10, int(target_height) - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (245, 250, 255), 1, cv2.LINE_AA)
+    cv2.putText(view, f"{far:.2f}m", (int(target_width) - 58, int(target_height) - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (245, 250, 255), 1, cv2.LINE_AA)
+    ok, encoded = cv2.imencode(".jpg", view, [int(cv2.IMWRITE_JPEG_QUALITY), 86])
+    return encoded.tobytes() if ok else b""
 
 
 def depth_assist_overlay_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
@@ -504,6 +533,7 @@ class RosMonitor:
         self.depth_points: list[list[float]] = []
         self.depth_surface: dict[str, Any] = {}
         self.depth_preview_png = b""
+        self.depth_view_jpg = b""
         self.depth_assist_overlay_png = b""
         self.depth_stats: dict[str, Any] = {}
         self.depth_error = ""
@@ -547,6 +577,7 @@ class RosMonitor:
                 "surface": self.depth_surface,
                 "stats": self.depth_stats,
                 "previewUrl": f"/api/depth-preview.png?t={int(self.last_depth_time * 1000)}" if self.depth_preview_png else "",
+                "depthViewUrl": f"/api/depth-view.jpg?t={int(self.last_depth_time * 1000)}" if self.depth_view_jpg else "",
                 "assistOverlayUrl": f"/api/depth-assist-overlay.png?t={int(self.last_depth_time * 1000)}" if self.depth_assist_overlay_png else "",
                 "total": self.depth_total,
                 "nearestMeters": self.depth_nearest,
@@ -625,11 +656,13 @@ class RosMonitor:
 
                 points, nearest, surface = depth_points_from_z16(frame, depth)
                 preview_png, depth_stats = depth_preview_from_z16(frame, depth)
+                depth_view_jpg = depth_view_from_z16(frame, depth)
                 assist_overlay_png, assist_stats = depth_assist_overlay_from_z16(frame, depth)
                 with self.lock:
                     self.depth_points = points
                     self.depth_surface = surface
                     self.depth_preview_png = preview_png
+                    self.depth_view_jpg = depth_view_jpg
                     self.depth_assist_overlay_png = assist_overlay_png
                     self.depth_stats = {**depth_stats, **assist_stats}
                     self.depth_frame = depth.get("fallbackOpticalFrame", "camera_depth_optical_frame")
@@ -692,7 +725,7 @@ class RosMonitor:
         depth_config = robot.get("depthSensor", {})
         point_cloud_topic = depth_config.get("pointCloudTopic") or topics.get("pointCloud", "")
         mission_topic = topics.get("missionEvents", "/fms/mission_events")
-        max_depth_points = max(100, min(12000, int(depth_config.get("maxPoints", 2400))))
+        max_depth_points = max(100, min(80000, int(depth_config.get("maxPoints", 2400))))
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
@@ -971,6 +1004,17 @@ def get_depth_preview() -> Response:
     if not content:
         raise HTTPException(status_code=404, detail="depth preview unavailable")
     return Response(content=content, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/depth-view.jpg")
+def get_depth_view() -> Response:
+    if _ROS_MONITOR is None:
+        raise HTTPException(status_code=404, detail="depth monitor not started")
+    with _ROS_MONITOR.lock:
+        content = _ROS_MONITOR.depth_view_jpg
+    if not content:
+        raise HTTPException(status_code=404, detail="depth view unavailable")
+    return Response(content=content, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/depth-assist-overlay.png")

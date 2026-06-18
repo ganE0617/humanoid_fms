@@ -302,8 +302,7 @@ function renderDepthAssist(depth) {
   const desired = Number(stats.desiredMeters || 0.45);
   const coverage = Number(stats.targetCoverage ?? stats.coverage ?? 0);
   const guidance = String(stats.guidance || (target ? "DEPTH READY" : "NO DEPTH"));
-  const overlay = $("#depth-assist-overlay");
-  updateImageSource(overlay, depth.assistOverlayUrl);
+  updateImageSource($("#depth-view"), depth.depthViewUrl || depth.previewUrl);
 
   setText("#grasp-distance", formatMeters(target));
   setText("#grasp-guidance", guidance);
@@ -311,7 +310,7 @@ function renderDepthAssist(depth) {
   setText("#grasp-confidence", Number.isFinite(coverage) ? `${Math.round(coverage * 100)}%` : "--");
   setText("#grasp-delta", target ? formatSignedMeters(target - desired) : "--");
 
-  const panel = $(".grasp-assist");
+  const panel = $(".depth-view-panel");
   if (panel) {
     panel.dataset.guidance = guidance.toLowerCase().replaceAll(" ", "-");
   }
@@ -475,14 +474,18 @@ function renderCameraGrid() {
   grid.innerHTML = state.config.cameras
     .map(
       (cam, index) => {
-        const isDepthCamera = cam.id === "realsense_rgb" || String(cam.role || "").includes("depth");
+        const isDepthView = cam.id === "aux_4" || String(cam.role || "") === "depth-z16";
         return `
-        <article class="camera-card ${isDepthCamera ? "is-depth-camera" : ""}" id="cam-${cam.id}">
+        <article class="camera-card ${isDepthView ? "is-depth-view" : ""}" id="cam-${cam.id}">
           <div class="camera-head">
             <span class="badge">${index + 1}. ${escapeHtml(cam.label)}</span>
             <span class="badge" data-cam-status="${cam.id}">WAIT</span>
           </div>
-          <img class="camera-stream" src="/stream/${cam.id}" alt="${escapeHtml(cam.label)} stream" onerror="this.classList.add('hidden'); this.parentElement.querySelector('.camera-empty').style.display='grid';" />
+          ${
+            isDepthView
+              ? `<img id="depth-view" class="camera-stream depth-view-image" alt="${escapeHtml(cam.label)} view" />`
+              : `<img class="camera-stream" src="/stream/${cam.id}" alt="${escapeHtml(cam.label)} stream" onerror="this.classList.add('hidden'); this.parentElement.querySelector('.camera-empty').style.display='grid';" />`
+          }
           <div class="camera-empty" style="display:none">
             <div>
               <b>${escapeHtml(cam.role)}</b>
@@ -490,17 +493,16 @@ function renderCameraGrid() {
             </div>
           </div>
           ${
-            isDepthCamera
+            isDepthView
               ? `
-                <img id="depth-assist-overlay" class="depth-assist-overlay" alt="" />
-                <div class="grasp-distance-pill">
-                  <span>target</span>
-                  <b id="grasp-distance">-- m</b>
-                </div>
-                <div class="grasp-assist" data-guidance="no-depth">
+                <div class="depth-view-panel">
                   <div class="grasp-assist-head">
-                    <span>Grasp Assist</span>
+                    <span>Depth Assist</span>
                     <strong id="grasp-guidance">NO DEPTH</strong>
+                  </div>
+                  <div class="depth-distance-line">
+                    <span>target</span>
+                    <b id="grasp-distance">-- m</b>
                   </div>
                   <div class="grasp-range">
                     <i></i>
@@ -928,9 +930,9 @@ function initMeshViewer() {
   const surfaceMaterial = new THREE.MeshBasicMaterial({
     vertexColors: true,
     transparent: true,
-    opacity: 0.72,
+    opacity: 0.84,
     side: THREE.DoubleSide,
-    depthTest: false,
+    depthTest: true,
     depthWrite: false,
   });
   const depthSurface = new THREE.Mesh(surfaceGeometry, surfaceMaterial);
@@ -939,13 +941,13 @@ function initMeshViewer() {
   depthGroup.add(depthSurface);
   const pointGeometry = new THREE.BufferGeometry();
   const pointMaterial = new THREE.PointsMaterial({
-    size: 0.055,
+    size: 0.018,
     map: makeDepthPointTexture(),
     vertexColors: true,
     transparent: true,
-    opacity: 0.82,
+    opacity: 0.96,
     alphaTest: 0.05,
-    depthTest: false,
+    depthTest: true,
     depthWrite: false,
   });
   const depthPoints = new THREE.Points(pointGeometry, pointMaterial);
@@ -1202,7 +1204,7 @@ function updateDepthGeometry() {
   const depth = state.depthState || {};
   const config = depth.config || state.config?.robots?.[state.robotId]?.depthSensor || {};
   const near = Number(config.nearMeters || 0.18);
-  const far = Number(config.farMeters || 3.0);
+  const far = Number(config.focusFarMeters || config.farMeters || 1.05);
   const hFov = THREE.MathUtils.degToRad(Number(config.horizontalFovDeg || 87));
   const vFov = THREE.MathUtils.degToRad(Number(config.verticalFovDeg || 58));
   const x = Math.tan(hFov / 2) * far;
