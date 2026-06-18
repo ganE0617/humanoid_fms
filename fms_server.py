@@ -118,33 +118,69 @@ class V4L2CtlCapture:
 
 
 class Z16DepthCapture:
-    def __init__(self, device: str, width: int, height: int):
+    def __init__(self, device: str, width: int, height: int, fps: int = 10):
         self.device = str(resolve_device(device) or device)
         self.width = width
         self.height = height
+        self.fps = max(1, int(fps))
+        self.cap = cv2.VideoCapture(capture_source(self.device), cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc("Z", "1", "6", " "))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+        if not self.cap.isOpened():
+            self.cap.release()
+            self.cap = None
+        self.proc: subprocess.Popen[bytes] | None = None
         self.frame_path = Path(f"/tmp/humanoid-fms-depth-{os.getpid()}-{abs(hash((self.device, width, height))) % 100000}.z16")
 
     def read(self):
-        command = [
-            "v4l2-ctl",
-            "-d",
-            self.device,
-            f"--set-fmt-video=width={self.width},height={self.height},pixelformat=Z16 ",
-            "--stream-mmap",
-            "--stream-count=1",
-            f"--stream-to={self.frame_path}",
-        ]
-        proc = run(command, timeout=3.0)
-        if proc.returncode != 0 or not self.frame_path.exists():
-            return False, None
-        raw = self.frame_path.read_bytes()
+        if self.cap is not None:
+            ok, frame = self.cap.read()
+            if ok and frame is not None:
+                if frame.dtype == np.uint16 and frame.ndim == 2:
+                    return True, frame.copy()
+                if frame.dtype == np.uint8 and frame.ndim == 3 and frame.shape[2] >= 2:
+                    raw = np.ascontiguousarray(frame[:, :, :2]).view(np.uint16).reshape(frame.shape[0], frame.shape[1])
+                    if raw.shape == (self.height, self.width):
+                        return True, raw.copy()
+                if frame.dtype == np.uint8 and frame.ndim == 2 and frame.size >= self.width * self.height * 2:
+                    raw = np.frombuffer(frame.data, dtype=np.uint16, count=self.width * self.height).reshape((self.height, self.width))
+                    return True, raw.copy()
+            self.cap.release()
+            self.cap = None
+
+        if self.proc is None or self.proc.poll() is not None or self.proc.stdout is None:
+            command = [
+                "v4l2-ctl",
+                "-d",
+                self.device,
+                f"--set-fmt-video=width={self.width},height={self.height},pixelformat=Z16 ",
+                "--stream-mmap",
+                "--stream-count=100000000",
+                "--stream-to=-",
+            ]
+            self.proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         expected = self.width * self.height * 2
+        raw = self.proc.stdout.read(expected) if self.proc.stdout else b""
         if len(raw) < expected:
+            self.release()
             return False, None
-        frame = np.frombuffer(raw[:expected], dtype=np.uint16).reshape((self.height, self.width))
+        frame = np.frombuffer(raw, dtype=np.uint16).reshape((self.height, self.width))
         return True, frame.copy()
 
     def release(self):
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        if self.proc is not None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+            self.proc = None
         try:
             self.frame_path.unlink(missing_ok=True)
         except Exception:
@@ -836,7 +872,10 @@ class RosMonitor:
         self.depth_preview_png = b""
         self.depth_view_jpg = b""
         self.depth_assist_overlay_png = b""
+        self.depth_raw_frame: np.ndarray | None = None
+        self.depth_raw_frame_time = 0.0
         self.depth_temporal_m: np.ndarray | None = None
+        self.depth_last_geometry_time = 0.0
         self.depth_stats: dict[str, Any] = {}
         self.depth_error = ""
         self.depth_total = 0
@@ -847,11 +886,13 @@ class RosMonitor:
         self.mission_queue: list[dict[str, Any]] = []
         self.mission_events: list[dict[str, Any]] = []
         self.thread = threading.Thread(target=self._run, name="fms-ros-monitor", daemon=True)
-        self.depth_thread = threading.Thread(target=self._run_depth_fallback, name="fms-depth-fallback", daemon=True)
+        self.depth_thread = threading.Thread(target=self._run_depth_fallback, name="fms-depth-stream", daemon=True)
+        self.depth_geometry_thread = threading.Thread(target=self._run_depth_geometry, name="fms-depth-geometry", daemon=True)
 
     def start(self) -> None:
         self.thread.start()
         self.depth_thread.start()
+        self.depth_geometry_thread.start()
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -930,6 +971,11 @@ class RosMonitor:
         return self.mission_snapshot()
 
     def _run_depth_fallback(self) -> None:
+        capture: Z16DepthCapture | None = None
+        capture_key: tuple[str, int, int, int] | None = None
+        last_assist_time = 0.0
+        last_assist_overlay_png = b""
+        last_assist_stats: dict[str, Any] = {}
         while True:
             try:
                 robot = robot_configs().get(self.robot_id, {})
@@ -938,23 +984,68 @@ class RosMonitor:
                 if not device or not Path(device).exists():
                     time.sleep(1.0)
                     continue
-                with self.lock:
-                    recent_ros_points = self.depth_source == "ros" and self.last_depth_time and time.time() - self.last_depth_time < 1.2
-                if recent_ros_points:
-                    time.sleep(0.5)
-                    continue
-
                 width, height = depth.get("fallbackResolution", [640, 480])
                 width = int(width)
                 height = int(height)
-                capture = Z16DepthCapture(device, width, height)
+                fps = max(1, int(float(depth.get("fallbackFps", 10))))
+                next_key = (str(resolve_device(device) or device), width, height, fps)
+                if capture is None or capture_key != next_key:
+                    if capture is not None:
+                        capture.release()
+                    capture = Z16DepthCapture(device, width, height, fps)
+                    capture_key = next_key
                 ok, frame = capture.read()
-                capture.release()
                 if not ok or frame is None:
+                    capture.release()
+                    capture = None
+                    capture_key = None
                     with self.lock:
                         if not self.depth_source:
                             self.depth_error = f"depth device unavailable: {device}"
                     time.sleep(1.0)
+                    continue
+
+                now = time.time()
+                depth_view_jpg = depth_view_from_z16(frame, depth)
+                assist_interval = max(0.05, float(depth.get("assistUpdateInterval", 0.2)))
+                if not last_assist_overlay_png or now - last_assist_time >= assist_interval:
+                    last_assist_overlay_png, last_assist_stats = depth_assist_overlay_from_z16(frame, depth)
+                    last_assist_time = now
+                with self.lock:
+                    self.depth_raw_frame = frame.copy()
+                    self.depth_raw_frame_time = now
+                    self.depth_view_jpg = depth_view_jpg
+                    self.depth_assist_overlay_png = last_assist_overlay_png
+                    self.depth_stats = {**self.depth_stats, **last_assist_stats}
+                    self.depth_frame = depth.get("fallbackOpticalFrame", "camera_depth_optical_frame")
+                    self.last_depth_time = now
+                    self.depth_total = int(frame.size)
+                    fallback_nearest = float(last_assist_stats.get("globalNearestMeters") or last_assist_stats.get("targetNearestMeters") or 0.0)
+                    self.depth_nearest = round(fallback_nearest, 3) if fallback_nearest else self.depth_nearest
+                    self.depth_source = "v4l2-z16"
+                    self.depth_error = ""
+                time.sleep(0.001)
+            except Exception as exc:
+                if capture is not None:
+                    capture.release()
+                    capture = None
+                    capture_key = None
+                with self.lock:
+                    self.depth_error = f"depth fallback {type(exc).__name__}: {exc}"
+                time.sleep(1.0)
+
+    def _run_depth_geometry(self) -> None:
+        last_processed_frame_time = 0.0
+        while True:
+            try:
+                robot = robot_configs().get(self.robot_id, {})
+                depth = robot.get("depthSensor", {})
+                interval = max(0.2, float(depth.get("geometryUpdateInterval", 0.7)))
+                with self.lock:
+                    frame_time = self.depth_raw_frame_time
+                    frame = self.depth_raw_frame.copy() if self.depth_raw_frame is not None and frame_time > last_processed_frame_time else None
+                if frame is None:
+                    time.sleep(0.05)
                     continue
 
                 processed_frame, self.depth_temporal_m, preprocess_stats = preprocess_depth_frame(
@@ -965,26 +1056,25 @@ class RosMonitor:
                 objects, label_map, segment_stats = segment_depth_objects_from_z16(processed_frame, depth)
                 points, nearest, surface = depth_points_from_z16(processed_frame, depth, label_map)
                 preview_png, depth_stats = depth_preview_from_z16(processed_frame, depth)
-                depth_view_jpg = depth_view_from_z16(processed_frame, depth)
-                assist_overlay_png, assist_stats = depth_assist_overlay_from_z16(processed_frame, depth)
                 with self.lock:
                     self.depth_points = points
                     self.depth_surface = surface
                     self.depth_objects = objects
                     self.depth_preview_png = preview_png
-                    self.depth_view_jpg = depth_view_jpg
-                    self.depth_assist_overlay_png = assist_overlay_png
-                    self.depth_stats = {**depth_stats, **assist_stats, "preprocess": preprocess_stats, "segmentation": segment_stats}
-                    self.depth_frame = depth.get("fallbackOpticalFrame", "camera_depth_optical_frame")
-                    self.last_depth_time = time.time()
-                    self.depth_total = int(frame.size)
-                    self.depth_nearest = round(nearest, 3) if nearest else 0.0
-                    self.depth_source = "v4l2-z16"
-                    self.depth_error = ""
-                time.sleep(1.0 / max(0.5, float(depth.get("fallbackFps", 2))))
+                    self.depth_stats = {
+                        **self.depth_stats,
+                        **depth_stats,
+                        "preprocess": preprocess_stats,
+                        "segmentation": segment_stats,
+                    }
+                    if nearest:
+                        self.depth_nearest = round(nearest, 3)
+                    self.depth_last_geometry_time = time.time()
+                last_processed_frame_time = frame_time
+                time.sleep(interval)
             except Exception as exc:
                 with self.lock:
-                    self.depth_error = f"depth fallback {type(exc).__name__}: {exc}"
+                    self.depth_error = f"depth geometry {type(exc).__name__}: {exc}"
                 time.sleep(1.0)
 
     def _run(self) -> None:
@@ -1220,6 +1310,8 @@ def camera_status() -> list[dict[str, Any]]:
         device = cam["device"]
         resolved = resolve_device(device)
         users = process_users(device)
+        if cam.get("role") == "depth-z16":
+            users = [user for user in users if "v4l2-ctl" not in str(user.get("command", ""))]
         status.append(
             {
                 **cam,
@@ -1327,6 +1419,34 @@ def get_depth_view() -> Response:
     return Response(content=content, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
+def depth_view_mjpeg_frames():
+    robots = robot_configs()
+    depth = (robots.get(os.getenv("FMS_ROBOT", "unitree")) or robots.get("unitree") or {}).get("depthSensor", {})
+    fps = max(1, min(30, int(depth.get("depthStreamFps", 15))))
+    delay = 1.0 / fps
+    last_time = 0.0
+    while True:
+        if _ROS_MONITOR is None:
+            time.sleep(delay)
+            continue
+        with _ROS_MONITOR.lock:
+            content = _ROS_MONITOR.depth_view_jpg
+            stamp = _ROS_MONITOR.last_depth_time
+        if not content:
+            time.sleep(delay)
+            continue
+        if stamp == last_time:
+            time.sleep(min(delay, 0.03))
+            continue
+        last_time = stamp
+        yield b"--frame\r\nContent-Type: image/jpeg\r\nCache-Control: no-store\r\n\r\n" + content + b"\r\n"
+
+
+@app.get("/stream/depth-view")
+def stream_depth_view() -> StreamingResponse:
+    return StreamingResponse(depth_view_mjpeg_frames(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
 @app.get("/api/depth-assist-overlay.png")
 def get_depth_assist_overlay() -> Response:
     if _ROS_MONITOR is None:
@@ -1384,6 +1504,8 @@ def open_capture(cam: dict[str, Any]):
         fallback_devices.append(candidate)
         attempted.append(str(device))
         cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*str(cam.get("fourcc", "MJPG"))[:4]))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         cap.set(cv2.CAP_PROP_FPS, fps)
@@ -1404,6 +1526,7 @@ def open_capture(cam: dict[str, Any]):
 def mjpeg_frames(cam: dict[str, Any], cap):
     fps = max(1, int(cam.get("fps", 15)))
     delay = 1.0 / fps
+    quality = max(70, min(95, int(cam.get("jpegQuality", 88))))
     lock = threading.Lock()
     try:
         while True:
@@ -1412,7 +1535,7 @@ def mjpeg_frames(cam: dict[str, Any], cap):
             if not ok:
                 time.sleep(delay)
                 continue
-            ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 78])
+            ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
             if not ok:
                 continue
             yield b"--frame\r\nContent-Type: image/jpeg\r\nCache-Control: no-store\r\n\r\n" + encoded.tobytes() + b"\r\n"

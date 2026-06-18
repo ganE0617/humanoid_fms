@@ -109,7 +109,7 @@ async function boot() {
   setupInteractions();
   setInterval(refreshStatus, 2500);
   setInterval(refreshRobotState, 80);
-  setInterval(refreshDepthState, 1000);
+  setInterval(refreshDepthState, 800);
   setInterval(refreshMissionState, 1000);
   setInterval(updateClock, 500);
   requestAnimationFrame(renderScene);
@@ -309,8 +309,6 @@ function renderDepthAssist(depth) {
   const desired = Number(stats.desiredMeters || 0.45);
   const coverage = Number(stats.targetCoverage ?? stats.coverage ?? 0);
   const guidance = String(stats.guidance || (target ? "DEPTH READY" : "NO DEPTH"));
-  updateImageSource($("#depth-view"), depth.depthViewUrl || depth.previewUrl);
-
   setText("#grasp-distance", formatMeters(target));
   setText("#grasp-guidance", guidance);
   setText("#grasp-nearest", formatMeters(stats.targetNearestMeters || stats.nearestMeters));
@@ -490,7 +488,7 @@ function renderCameraGrid() {
           </div>
           ${
             isDepthView
-              ? `<img id="depth-view" class="camera-stream depth-view-image" alt="${escapeHtml(cam.label)} view" />`
+              ? `<img id="depth-view" class="camera-stream depth-view-image" src="/stream/depth-view" alt="${escapeHtml(cam.label)} view" onerror="this.classList.add('hidden'); this.parentElement.querySelector('.camera-empty').style.display='grid';" />`
               : `<img class="camera-stream" src="/stream/${cam.id}" alt="${escapeHtml(cam.label)} stream" onerror="this.classList.add('hidden'); this.parentElement.querySelector('.camera-empty').style.display='grid';" />`
           }
           <div class="camera-empty" style="display:none">
@@ -1389,16 +1387,6 @@ function updateDepthGeometry() {
       const box = new THREE.LineSegments(geometry, lineMaterial);
       box.renderOrder = 8;
       depthObjectMarkers.add(box);
-    }
-    if (Array.isArray(object.centroid)) {
-      const radius = Math.max(0.018, Math.min(0.045, Number(object.distanceMeters || 0.4) * 0.035));
-      const marker = new THREE.Mesh(
-        new THREE.SphereGeometry(radius, 16, 10),
-        new THREE.MeshBasicMaterial({ color: new THREE.Color(color[0], color[1], color[2]), depthTest: false }),
-      );
-      marker.position.set(Number(object.centroid[0]), Number(object.centroid[1]), Number(object.centroid[2]));
-      marker.renderOrder = 9;
-      depthObjectMarkers.add(marker);
     }
   });
 

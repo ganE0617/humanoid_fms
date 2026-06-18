@@ -6,7 +6,8 @@
     "device": "/dev/logitech1_camera",
     "captureCandidates": ["/dev/logitech1_camera", "/dev/video0"],
     "resolution": [640, 360],
-    "fps": 15,
+    "fps": 30,
+    "jpegQuality": 88,
     "fov": 78
   },
   {
@@ -16,7 +17,8 @@
     "device": "/dev/logitech2_camera",
     "captureCandidates": ["/dev/logitech2_camera", "/dev/video3"],
     "resolution": [640, 360],
-    "fps": 15,
+    "fps": 30,
+    "jpegQuality": 88,
     "fov": 78
   },
   {
@@ -26,7 +28,8 @@
     "device": "/dev/realsense_camera",
     "captureCandidates": ["/dev/realsense_camera", "/dev/video6", "/dev/video8"],
     "resolution": [640, 360],
-    "fps": 15,
+    "fps": 30,
+    "jpegQuality": 88,
     "fov": 87
   },
   {
@@ -36,7 +39,8 @@
     "device": "/dev/video4",
     "captureCandidates": ["/dev/video4"],
     "resolution": [640, 360],
-    "fps": 15,
+    "fps": 30,
+    "jpegQuality": 88,
     "fov": 87
   }
 ]
