@@ -28,6 +28,8 @@ DOCKER_SOCKET = Path("/var/run/docker.sock")
 app = FastAPI(title="Humanoid FMS", version="0.1.0")
 _STATUS_CACHE: dict[str, Any] = {"time": 0.0, "data": None}
 _ROS_MONITOR: "RosMonitor | None" = None
+_CAMERA_WORKERS: dict[str, "CameraStreamWorker"] = {}
+_CAMERA_WORKERS_LOCK = threading.Lock()
 VENDOR_DIR.mkdir(exist_ok=True)
 
 
@@ -735,19 +737,32 @@ def depth_preview_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[b
     }
 
 
-def depth_view_from_z16(frame: np.ndarray, config: dict[str, Any]) -> bytes:
+def crop_to_aspect(frame: np.ndarray, aspect: float) -> np.ndarray:
+    height, width = frame.shape[:2]
+    if height <= 0 or width <= 0:
+        return frame
+    current = width / height
+    if abs(current - aspect) < 0.01:
+        return frame
+    if current > aspect:
+        crop_width = max(1, int(round(height * aspect)))
+        x = max(0, (width - crop_width) // 2)
+        return frame[:, x:x + crop_width]
+    crop_height = max(1, int(round(width / aspect)))
+    y = max(0, (height - crop_height) // 2)
+    return frame[y:y + crop_height, :]
+
+
+def depth_view_from_z16(frame: np.ndarray, config: dict[str, Any], color_frame: np.ndarray | None = None) -> bytes:
     scale = float(config.get("depthScaleMeters", 0.001))
     near = float(config.get("nearMeters", 0.18))
     far = min(float(config.get("farMeters", 3.0)), float(config.get("depthViewFarMeters", 1.4)))
     depth_m = frame.astype(np.float32) * scale
     valid = (frame > 0) & (frame < 65535) & (depth_m >= near) & (depth_m <= far)
 
-    height, width = frame.shape[:2]
     target_aspect = 16 / 9
-    crop_height = min(height, int(round(width / target_aspect)))
-    crop_y = max(0, (height - crop_height) // 2)
-    depth_crop = depth_m[crop_y:crop_y + crop_height, :]
-    valid_crop = valid[crop_y:crop_y + crop_height, :]
+    depth_crop = crop_to_aspect(depth_m, target_aspect)
+    valid_crop = crop_to_aspect(valid.astype(np.uint8), target_aspect).astype(bool)
 
     clipped = np.clip(depth_crop, near, far)
     inverse = ((far - clipped) / max(0.001, far - near) * 255.0).astype(np.uint8)
@@ -756,12 +771,25 @@ def depth_view_from_z16(frame: np.ndarray, config: dict[str, Any]) -> bytes:
     color[~valid_crop] = (10, 14, 19)
 
     target_width, target_height = config.get("depthViewResolution", [640, 360])
-    view = cv2.resize(color, (int(target_width), int(target_height)), interpolation=cv2.INTER_CUBIC)
+    target_size = (int(target_width), int(target_height))
+    view = cv2.resize(color, target_size, interpolation=cv2.INTER_CUBIC)
+    mask = cv2.resize(valid_crop.astype(np.uint8), target_size, interpolation=cv2.INTER_NEAREST).astype(bool)
     shift_y = int(config.get("depthViewShiftY", 0))
     shift_x = int(config.get("depthViewShiftX", 0))
     if shift_x or shift_y:
         matrix = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
-        view = cv2.warpAffine(view, matrix, (int(target_width), int(target_height)), borderValue=(10, 14, 19))
+        view = cv2.warpAffine(view, matrix, target_size, borderValue=(10, 14, 19))
+        mask = cv2.warpAffine(mask.astype(np.uint8), matrix, target_size, flags=cv2.INTER_NEAREST, borderValue=0).astype(bool)
+
+    if color_frame is not None and str(config.get("depthViewMode", "rgb_overlay")) == "rgb_overlay":
+        base = crop_to_aspect(color_frame, target_aspect)
+        if base.size:
+            base = cv2.resize(base, target_size, interpolation=cv2.INTER_AREA)
+            alpha = max(0.15, min(0.9, float(config.get("depthViewOverlayAlpha", 0.58))))
+            blended = base.copy()
+            if np.any(mask):
+                blended[mask] = cv2.addWeighted(base[mask], 1.0 - alpha, view[mask], alpha, 0.0)
+            view = blended
     cv2.putText(view, f"{near:.2f}m", (10, int(target_height) - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (245, 250, 255), 1, cv2.LINE_AA)
     cv2.putText(view, f"{far:.2f}m", (int(target_width) - 58, int(target_height) - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (245, 250, 255), 1, cv2.LINE_AA)
     ok, encoded = cv2.imencode(".jpg", view, [int(cv2.IMWRITE_JPEG_QUALITY), 86])
@@ -1011,7 +1039,11 @@ class RosMonitor:
                     continue
 
                 now = time.time()
-                depth_view_jpg = depth_view_from_z16(frame, depth)
+                color_frame = None
+                color_camera_id = str(depth.get("depthRgbCameraId", "realsense_rgb"))
+                if color_camera_id:
+                    color_frame, _ = latest_camera_frame(color_camera_id, max_age=0.5)
+                depth_view_jpg = depth_view_from_z16(frame, depth, color_frame=color_frame)
                 assist_interval = max(0.05, float(depth.get("assistUpdateInterval", 0.2)))
                 if not last_assist_overlay_png or now - last_assist_time >= assist_interval:
                     last_assist_overlay_png, last_assist_stats = depth_assist_overlay_from_z16(frame, depth)
@@ -1528,25 +1560,102 @@ def open_capture(cam: dict[str, Any]):
     raise HTTPException(status_code=503, detail=f"camera unavailable: {cam['device']} attempted {attempted}")
 
 
-def mjpeg_frames(cam: dict[str, Any], cap):
-    fps = max(1, int(cam.get("fps", 15)))
-    delay = 1.0 / fps
-    quality = max(70, min(95, int(cam.get("jpegQuality", 88))))
-    lock = threading.Lock()
-    try:
+class CameraStreamWorker:
+    def __init__(self, cam: dict[str, Any]):
+        self.cam = dict(cam)
+        self.condition = threading.Condition()
+        self.thread: threading.Thread | None = None
+        self.jpeg = b""
+        self.frame: np.ndarray | None = None
+        self.stamp = 0.0
+        self.seq = 0
+        self.error = ""
+        self.quality = max(70, min(95, int(self.cam.get("jpegQuality", 88))))
+
+    def start(self) -> None:
+        with self.condition:
+            if self.thread and self.thread.is_alive():
+                return
+            self.thread = threading.Thread(target=self._run, name=f"fms-camera-{self.cam.get('id', 'camera')}", daemon=True)
+            self.thread.start()
+
+    def _run(self) -> None:
+        cap = None
         while True:
-            with lock:
-                ok, frame = cap.read()
-            if not ok:
-                time.sleep(delay)
-                continue
-            ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-            if not ok:
-                continue
-            yield b"--frame\r\nContent-Type: image/jpeg\r\nCache-Control: no-store\r\n\r\n" + encoded.tobytes() + b"\r\n"
-            time.sleep(delay)
-    finally:
-        cap.release()
+            try:
+                if not Path(self.cam["device"]).exists():
+                    raise RuntimeError(f"camera device missing: {self.cam['device']}")
+                cap = open_capture(self.cam)
+                with self.condition:
+                    self.error = ""
+                    self.condition.notify_all()
+                while True:
+                    ok, frame = cap.read()
+                    if not ok or frame is None:
+                        time.sleep(0.005)
+                        continue
+                    width, height = self.cam.get("resolution", [640, 360])
+                    if frame.shape[1] != int(width) or frame.shape[0] != int(height):
+                        frame = cv2.resize(frame, (int(width), int(height)), interpolation=cv2.INTER_AREA)
+                    ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality])
+                    if not ok:
+                        continue
+                    now = time.time()
+                    with self.condition:
+                        self.frame = frame
+                        self.jpeg = encoded.tobytes()
+                        self.stamp = now
+                        self.seq += 1
+                        self.condition.notify_all()
+            except Exception as exc:
+                with self.condition:
+                    self.error = f"{type(exc).__name__}: {exc}"
+                    self.condition.notify_all()
+                time.sleep(0.5)
+            finally:
+                if cap is not None:
+                    cap.release()
+                    cap = None
+
+    def latest_frame(self, max_age: float = 0.35) -> tuple[np.ndarray | None, float]:
+        self.start()
+        with self.condition:
+            if self.frame is None or not self.stamp or time.time() - self.stamp > max_age:
+                return None, self.stamp
+            return self.frame.copy(), self.stamp
+
+    def mjpeg_frames(self):
+        self.start()
+        last_seq = 0
+        while True:
+            with self.condition:
+                self.condition.wait_for(lambda: self.seq != last_seq or bool(self.error), timeout=1.0)
+                seq = self.seq
+                jpeg = self.jpeg
+            if jpeg and seq != last_seq:
+                last_seq = seq
+                yield b"--frame\r\nContent-Type: image/jpeg\r\nCache-Control: no-store\r\n\r\n" + jpeg + b"\r\n"
+            else:
+                time.sleep(0.01)
+
+
+def camera_worker(cam: dict[str, Any]) -> CameraStreamWorker:
+    camera_id = str(cam["id"])
+    with _CAMERA_WORKERS_LOCK:
+        worker = _CAMERA_WORKERS.get(camera_id)
+        if worker is None or worker.cam != dict(cam):
+            worker = CameraStreamWorker(cam)
+            _CAMERA_WORKERS[camera_id] = worker
+        worker.start()
+        return worker
+
+
+def latest_camera_frame(camera_id: str, max_age: float = 0.35) -> tuple[np.ndarray | None, float]:
+    cams = {cam["id"]: cam for cam in camera_config()}
+    cam = cams.get(camera_id)
+    if not cam:
+        return None, 0.0
+    return camera_worker(cam).latest_frame(max_age=max_age)
 
 
 @app.get("/stream/{camera_id}")
@@ -1557,8 +1666,9 @@ def stream_camera(camera_id: str) -> StreamingResponse:
     cam = cams[camera_id]
     if not Path(cam["device"]).exists():
         raise HTTPException(status_code=404, detail=f"camera device missing: {cam['device']}")
-    cap = open_capture(cam)
-    return StreamingResponse(mjpeg_frames(cam, cap), media_type="multipart/x-mixed-replace; boundary=frame")
+    if str(cam.get("role", "")) == "depth-z16":
+        return stream_depth_view()
+    return StreamingResponse(camera_worker(cam).mjpeg_frames(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 
 @app.on_event("startup")

@@ -15,7 +15,7 @@ services:
       FMS_ROBOT: "unitree"
       ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-0}"
       RMW_IMPLEMENTATION: "${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
-      CYCLONEDDS_URI: "${CYCLONEDDS_URI:-<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='eno1'/></Interfaces><AllowMulticast>true</AllowMulticast></General></Domain></CycloneDDS>}"
+      CYCLONEDDS_URI: "${CYCLONEDDS_URI:-<CycloneDDS><Domain><General><AllowMulticast>true</AllowMulticast></General></Domain></CycloneDDS>}"
     volumes:
       - ./config:/app/config:ro
       - ./web:/app/web:ro

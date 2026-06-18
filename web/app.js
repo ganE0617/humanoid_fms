@@ -101,7 +101,7 @@ async function boot() {
   renderRobotSelect();
   renderTopicMap();
   renderCameraGrid();
-  await loadUrdf();
+  loadUrdf();
   await refreshStatus();
   await refreshRobotState();
   await refreshDepthState();
