@@ -108,7 +108,7 @@ async function boot() {
   setupInteractions();
   setInterval(refreshStatus, 2500);
   setInterval(refreshRobotState, 80);
-  setInterval(refreshDepthState, 500);
+  setInterval(refreshDepthState, 1000);
   setInterval(refreshMissionState, 1000);
   setInterval(updateClock, 500);
   requestAnimationFrame(renderScene);
@@ -253,8 +253,9 @@ function renderDepthLabel() {
   }
   const age = Math.max(0, Date.now() / 1000 - depth.lastDepthTime).toFixed(1);
   const nearest = depth.nearestMeters ? ` near ${Number(depth.nearestMeters).toFixed(2)}m` : "";
+  const prep = depth.stats?.preprocess?.processedValid ? " filtered" : "";
   const source = depth.dataSource ? `${depth.dataSource} ` : "";
-  setText("#scene-depth", `${source}${points.length} pts${nearest} / ${normalizeFrameId(depth.frameId)} / ${age}s`);
+  setText("#scene-depth", `${source}${points.length} pts${prep}${nearest} / ${normalizeFrameId(depth.frameId)} / ${age}s`);
 }
 
 function formatMeters(value) {
@@ -927,10 +928,12 @@ function initMeshViewer() {
   const depthGroup = new THREE.Group();
   depthGroup.matrixAutoUpdate = false;
   const surfaceGeometry = new THREE.BufferGeometry();
-  const surfaceMaterial = new THREE.MeshBasicMaterial({
+  const surfaceMaterial = new THREE.MeshStandardMaterial({
     vertexColors: true,
     transparent: true,
-    opacity: 0.84,
+    opacity: 0.9,
+    roughness: 0.82,
+    metalness: 0.0,
     side: THREE.DoubleSide,
     depthTest: true,
     depthWrite: false,
@@ -941,7 +944,7 @@ function initMeshViewer() {
   depthGroup.add(depthSurface);
   const pointGeometry = new THREE.BufferGeometry();
   const pointMaterial = new THREE.PointsMaterial({
-    size: 0.018,
+    size: 0.014,
     map: makeDepthPointTexture(),
     vertexColors: true,
     transparent: true,
@@ -1274,6 +1277,7 @@ function updateDepthGeometry() {
   depthSurface.geometry.setIndex(indices);
   depthSurface.geometry.setAttribute("position", new THREE.Float32BufferAttribute(surfacePositions, 3));
   depthSurface.geometry.setAttribute("color", new THREE.Float32BufferAttribute(surfaceColors, 3));
+  depthSurface.geometry.computeVertexNormals();
   depthSurface.geometry.computeBoundingSphere();
   if (
     surfacePositions.length &&

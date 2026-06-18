@@ -352,6 +352,89 @@ def depth_points_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[li
     return points, nearest, surface
 
 
+def preprocess_depth_frame(
+    frame: np.ndarray,
+    config: dict[str, Any],
+    previous_depth_m: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    scale = float(config.get("depthScaleMeters", 0.001))
+    near = float(config.get("nearMeters", 0.18))
+    far = float(config.get("farMeters", 3.0))
+    focus_far = min(far, float(config.get("focusFarMeters", far)))
+    depth_m = frame.astype(np.float32) * scale
+    valid = (frame > 0) & (frame < 65535) & (depth_m >= near) & (depth_m <= far)
+    raw_valid_count = int(np.count_nonzero(valid))
+
+    if bool(config.get("holeFill", True)):
+        median_ksize = int(config.get("holeFillMedian", 5))
+        if median_ksize % 2 == 0:
+            median_ksize += 1
+        median_ksize = max(3, min(9, median_ksize))
+        median_frame = cv2.medianBlur(frame, median_ksize)
+        median_m = median_frame.astype(np.float32) * scale
+        fill = (~valid) & (median_frame > 0) & (median_frame < 65535) & (median_m >= near) & (median_m <= far)
+        depth_m[fill] = median_m[fill]
+        valid |= fill
+
+    persisted_count = 0
+    if previous_depth_m is not None and previous_depth_m.shape == depth_m.shape:
+        previous_valid = (previous_depth_m >= near) & (previous_depth_m <= far)
+        max_delta = float(config.get("temporalMaxDeltaMeters", 0.18))
+        missing = (~valid) & previous_valid
+        depth_m[missing] = previous_depth_m[missing]
+        valid[missing] = True
+        persisted_count = int(np.count_nonzero(missing))
+        stable = valid & previous_valid & (np.abs(depth_m - previous_depth_m) <= max_delta)
+        alpha = float(config.get("temporalAlpha", 0.45))
+        alpha = max(0.05, min(1.0, alpha))
+        depth_m[stable] = alpha * depth_m[stable] + (1.0 - alpha) * previous_depth_m[stable]
+
+    if bool(config.get("spatialFilter", True)):
+        bilateral_d = int(config.get("bilateralDiameter", 5))
+        if bilateral_d % 2 == 0:
+            bilateral_d += 1
+        bilateral_d = max(3, min(9, bilateral_d))
+        sigma_color = float(config.get("bilateralSigmaColorMeters", 0.05))
+        sigma_space = float(config.get("bilateralSigmaSpace", 5.0))
+        filtered = cv2.bilateralFilter(depth_m.astype(np.float32), bilateral_d, sigma_color, sigma_space)
+        filtered_valid = valid & (filtered >= near) & (filtered <= far)
+        depth_m[filtered_valid] = filtered[filtered_valid]
+
+    focus_mask = valid & (depth_m >= near) & (depth_m <= focus_far)
+    if bool(config.get("componentFilter", True)):
+        kernel = np.ones((3, 3), np.uint8)
+        mask = focus_mask.astype(np.uint8) * 255
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=int(config.get("componentCloseIterations", 1)))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=int(config.get("componentOpenIterations", 1)))
+        labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+        keep = np.zeros_like(focus_mask, dtype=bool)
+        min_area = int(config.get("componentMinPixels", 90))
+        kept_components = 0
+        for label in range(1, labels_count):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if area < min_area:
+                continue
+            component = labels == label
+            keep |= component
+            kept_components += 1
+        focus_mask &= keep
+    else:
+        kept_components = 0
+
+    output_m = np.zeros_like(depth_m, dtype=np.float32)
+    output_m[focus_mask] = depth_m[focus_mask]
+    processed = np.clip(np.round(output_m / scale), 0, 65535).astype(np.uint16)
+    temporal_m = output_m.copy()
+    stats = {
+        "rawValid": raw_valid_count,
+        "processedValid": int(np.count_nonzero(processed)),
+        "persisted": persisted_count,
+        "components": int(kept_components),
+        "focusFarMeters": focus_far,
+    }
+    return processed, temporal_m, stats
+
+
 def depth_preview_from_z16(frame: np.ndarray, config: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
     scale = float(config.get("depthScaleMeters", 0.001))
     near = float(config.get("nearMeters", 0.18))
@@ -535,6 +618,7 @@ class RosMonitor:
         self.depth_preview_png = b""
         self.depth_view_jpg = b""
         self.depth_assist_overlay_png = b""
+        self.depth_temporal_m: np.ndarray | None = None
         self.depth_stats: dict[str, Any] = {}
         self.depth_error = ""
         self.depth_total = 0
@@ -654,17 +738,22 @@ class RosMonitor:
                     time.sleep(1.0)
                     continue
 
-                points, nearest, surface = depth_points_from_z16(frame, depth)
-                preview_png, depth_stats = depth_preview_from_z16(frame, depth)
-                depth_view_jpg = depth_view_from_z16(frame, depth)
-                assist_overlay_png, assist_stats = depth_assist_overlay_from_z16(frame, depth)
+                processed_frame, self.depth_temporal_m, preprocess_stats = preprocess_depth_frame(
+                    frame,
+                    depth,
+                    self.depth_temporal_m,
+                )
+                points, nearest, surface = depth_points_from_z16(processed_frame, depth)
+                preview_png, depth_stats = depth_preview_from_z16(processed_frame, depth)
+                depth_view_jpg = depth_view_from_z16(processed_frame, depth)
+                assist_overlay_png, assist_stats = depth_assist_overlay_from_z16(processed_frame, depth)
                 with self.lock:
                     self.depth_points = points
                     self.depth_surface = surface
                     self.depth_preview_png = preview_png
                     self.depth_view_jpg = depth_view_jpg
                     self.depth_assist_overlay_png = assist_overlay_png
-                    self.depth_stats = {**depth_stats, **assist_stats}
+                    self.depth_stats = {**depth_stats, **assist_stats, "preprocess": preprocess_stats}
                     self.depth_frame = depth.get("fallbackOpticalFrame", "camera_depth_optical_frame")
                     self.last_depth_time = time.time()
                     self.depth_total = int(frame.size)
