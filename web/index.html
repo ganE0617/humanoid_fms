@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Humanoid FMS</title>
-    <link rel="stylesheet" href="/styles.css?v=20260619-native-aspect" />
+    <link rel="stylesheet" href="/styles.css?v=20260619-rgb-overlay-sync" />
   </head>
   <body class="adapter-collapsed status-collapsed">
     <main class="shell">
@@ -84,7 +84,10 @@
         <section class="panel scene-panel">
           <div class="panel-title">
             <span>3D View</span>
-            <strong>URDF/TF READY</strong>
+            <div class="scene-title-actions">
+              <button id="depth-rgb-toggle" class="mini-toggle" type="button" aria-pressed="false">RGB OFF</button>
+              <strong>URDF/TF READY</strong>
+            </div>
           </div>
           <canvas id="scene-canvas" width="960" height="720"></canvas>
           <div class="depth-hud" aria-label="Depth camera">
@@ -142,6 +145,6 @@
         }
       }
     </script>
-    <script type="module" src="/app.js?v=20260619-native-aspect"></script>
+    <script type="module" src="/app.js?v=20260619-rgb-overlay-sync"></script>
   </body>
 </html>

@@ -13,6 +13,7 @@ const state = {
   robotState: null,
   depthState: null,
   missionState: null,
+  depthRgbOverlay: false,
   stableRobotState: {
     joints: {},
     transforms: [],
@@ -97,16 +98,18 @@ function statusClass(cam) {
 
 async function boot() {
   state.config = await fetchJson("/api/config");
+  state.depthRgbOverlay = localStorage.getItem("fmsDepthRgbOverlay") === "1";
   initMeshViewer();
   renderRobotSelect();
   renderTopicMap();
   renderCameraGrid();
+  setupInteractions();
+  updateDepthRgbToggle();
   loadUrdf();
   await refreshStatus();
   await refreshRobotState();
   await refreshDepthState();
   await refreshMissionState();
-  setupInteractions();
   setInterval(refreshStatus, 2500);
   setInterval(refreshRobotState, 80);
   setInterval(refreshDepthState, 800);
@@ -653,6 +656,16 @@ function renderDockerStatus() {
 function setupInteractions() {
   $("#refresh-btn").addEventListener("click", refreshStatus);
 
+  const rgbToggle = $("#depth-rgb-toggle");
+  if (rgbToggle) {
+    rgbToggle.addEventListener("click", () => {
+      state.depthRgbOverlay = !state.depthRgbOverlay;
+      localStorage.setItem("fmsDepthRgbOverlay", state.depthRgbOverlay ? "1" : "0");
+      updateDepthRgbToggle();
+      updateDepthGeometry();
+    });
+  }
+
   document.querySelectorAll("[data-toggle-panel]").forEach((button) => {
     const panel = button.dataset.togglePanel;
     button.classList.toggle("active", !document.body.classList.contains(`${panel}-collapsed`));
@@ -713,6 +726,14 @@ function setupInteractions() {
       updateDriveMeters();
     });
   });
+}
+
+function updateDepthRgbToggle() {
+  const button = $("#depth-rgb-toggle");
+  if (!button) return;
+  button.classList.toggle("active", state.depthRgbOverlay);
+  button.setAttribute("aria-pressed", state.depthRgbOverlay ? "true" : "false");
+  button.textContent = state.depthRgbOverlay ? "RGB ON" : "RGB OFF";
 }
 
 function updateDriveMeters() {
@@ -1225,6 +1246,12 @@ function objectColor(id, objects) {
 
 function colorForDepthPoint(point, near, far, objects) {
   const objectId = Number(point?.[3] ?? -1);
+  if (state.depthRgbOverlay && objectId >= 0 && point?.length >= 7) {
+    const r = clamp(Number(point[4]) / 255, 0, 1);
+    const g = clamp(Number(point[5]) / 255, 0, 1);
+    const b = clamp(Number(point[6]) / 255, 0, 1);
+    if ([r, g, b].every(Number.isFinite)) return [r, g, b];
+  }
   const clusterColor = objectId >= 0 ? objectColor(objectId, objects) : null;
   if (clusterColor) return clusterColor;
   const px = Number(point?.[0] || 0);

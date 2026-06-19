@@ -207,6 +207,30 @@ body.status-collapsed .status-panel {
   font-weight: 750;
 }
 
+.scene-title-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mini-toggle {
+  min-height: 24px;
+  padding: 0 9px;
+  border: 1px solid rgba(74, 92, 112, 0.9);
+  border-radius: 6px;
+  background: rgba(7, 12, 18, 0.88);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.mini-toggle.active {
+  border-color: rgba(94, 228, 147, 0.75);
+  color: var(--green);
+  background: rgba(31, 83, 56, 0.32);
+}
+
 .robot-panel,
 .teleop-panel {
   min-height: 0;

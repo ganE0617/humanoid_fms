@@ -30,6 +30,10 @@ _STATUS_CACHE: dict[str, Any] = {"time": 0.0, "data": None}
 _ROS_MONITOR: "RosMonitor | None" = None
 _CAMERA_WORKERS: dict[str, "CameraStreamWorker"] = {}
 _CAMERA_WORKERS_LOCK = threading.Lock()
+_SYNC_CONDITION = threading.Condition()
+_SYNC_THREAD: threading.Thread | None = None
+_SYNC_SEQ = 0
+_SYNC_TIME = 0.0
 VENDOR_DIR.mkdir(exist_ok=True)
 
 
@@ -44,6 +48,44 @@ def run(cmd: list[str], timeout: float = 3.0) -> subprocess.CompletedProcess[str
 
 def sh(command: str, timeout: float = 3.0) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, shell=True, text=True, capture_output=True, timeout=timeout, check=False)
+
+
+def sync_fps() -> int:
+    return max(5, min(30, int(float(os.getenv("FMS_CAMERA_SYNC_FPS", "20")))))
+
+
+def start_sync_clock() -> None:
+    global _SYNC_THREAD
+    with _SYNC_CONDITION:
+        if _SYNC_THREAD and _SYNC_THREAD.is_alive():
+            return
+        _SYNC_THREAD = threading.Thread(target=_sync_clock_loop, name="fms-camera-sync", daemon=True)
+        _SYNC_THREAD.start()
+
+
+def _sync_clock_loop() -> None:
+    global _SYNC_SEQ, _SYNC_TIME
+    interval = 1.0 / float(sync_fps())
+    next_tick = time.time()
+    while True:
+        now = time.time()
+        if next_tick > now:
+            time.sleep(next_tick - now)
+        tick_time = time.time()
+        with _SYNC_CONDITION:
+            _SYNC_SEQ += 1
+            _SYNC_TIME = tick_time
+            _SYNC_CONDITION.notify_all()
+        next_tick += interval
+        if next_tick < tick_time - interval:
+            next_tick = tick_time + interval
+
+
+def wait_sync_tick(last_seq: int, timeout: float = 1.0) -> tuple[int, float]:
+    start_sync_clock()
+    with _SYNC_CONDITION:
+        _SYNC_CONDITION.wait_for(lambda: _SYNC_SEQ != last_seq, timeout=timeout)
+        return _SYNC_SEQ, _SYNC_TIME
 
 
 def camera_config() -> list[dict[str, Any]]:
@@ -333,6 +375,7 @@ def depth_points_from_z16(
     frame: np.ndarray,
     config: dict[str, Any],
     label_map: np.ndarray | None = None,
+    color_frame: np.ndarray | None = None,
 ) -> tuple[list[list[float]], float, dict[str, Any]]:
     height, width = frame.shape[:2]
     max_points = max(100, min(80000, int(config.get("maxPoints", 8000))))
@@ -349,6 +392,11 @@ def depth_points_from_z16(
 
     depth_m = frame.astype(np.float32) * scale
     valid = (frame > 0) & (frame < 65535) & (depth_m >= near) & (depth_m <= point_far)
+    color_rgb: np.ndarray | None = None
+    if color_frame is not None and color_frame.size:
+        if color_frame.shape[:2] != frame.shape[:2]:
+            color_frame = cv2.resize(color_frame, (width, height), interpolation=cv2.INTER_AREA)
+        color_rgb = cv2.cvtColor(color_frame, cv2.COLOR_BGR2RGB)
     if label_map is not None and label_map.shape == frame.shape and np.any(label_map >= 0):
         object_vs, object_us = np.nonzero(valid & (label_map >= 0))
         background_vs, background_us = np.nonzero(valid & (label_map < 0))
@@ -385,6 +433,9 @@ def depth_points_from_z16(
         if label_map is not None and label_map.shape == frame.shape:
             labels = label_map[vs, us].astype(np.float32)
             columns.append(labels)
+        if color_rgb is not None:
+            rgb = color_rgb[vs, us].astype(np.float32)
+            columns.extend([rgb[:, 0], rgb[:, 1], rgb[:, 2]])
         points = np.column_stack(columns).round(4).astype(float).tolist()
     else:
         points = []
@@ -418,6 +469,11 @@ def depth_points_from_z16(
                     point.append(float(np.argmax(counts)))
                 else:
                     point.append(-1.0)
+            if color_rgb is not None:
+                patch_rgb = color_rgb[v0:v1, u0:u1][patch_valid]
+                if patch_rgb.size:
+                    rgb = np.median(patch_rgb, axis=0)
+                    point.extend([round(float(rgb[0]), 1), round(float(rgb[1]), 1), round(float(rgb[2]), 1)])
             surface_points.append(point)
 
     surface = {
@@ -1087,13 +1143,17 @@ class RosMonitor:
                     time.sleep(0.05)
                     continue
 
+                color_frame = None
+                color_camera_id = str(depth.get("depthRgbCameraId", "realsense_rgb"))
+                if color_camera_id:
+                    color_frame, _ = latest_camera_frame(color_camera_id, max_age=0.7)
                 processed_frame, self.depth_temporal_m, preprocess_stats = preprocess_depth_frame(
                     frame,
                     depth,
                     self.depth_temporal_m,
                 )
                 objects, label_map, segment_stats = segment_depth_objects_from_z16(processed_frame, depth)
-                points, nearest, surface = depth_points_from_z16(processed_frame, depth, label_map)
+                points, nearest, surface = depth_points_from_z16(processed_frame, depth, label_map, color_frame=color_frame)
                 preview_png, depth_stats = depth_preview_from_z16(processed_frame, depth)
                 with self.lock:
                     self.depth_points = points
@@ -1459,25 +1519,16 @@ def get_depth_view() -> Response:
 
 
 def depth_view_mjpeg_frames():
-    robots = robot_configs()
-    depth = (robots.get(os.getenv("FMS_ROBOT", "unitree")) or robots.get("unitree") or {}).get("depthSensor", {})
-    fps = max(1, min(30, int(depth.get("depthStreamFps", 15))))
-    delay = 1.0 / fps
-    last_time = 0.0
+    last_seq = 0
     while True:
+        seq, _ = wait_sync_tick(last_seq)
+        last_seq = seq
         if _ROS_MONITOR is None:
-            time.sleep(delay)
             continue
         with _ROS_MONITOR.lock:
             content = _ROS_MONITOR.depth_view_jpg
-            stamp = _ROS_MONITOR.last_depth_time
         if not content:
-            time.sleep(delay)
             continue
-        if stamp == last_time:
-            time.sleep(min(delay, 0.03))
-            continue
-        last_time = stamp
         yield b"--frame\r\nContent-Type: image/jpeg\r\nCache-Control: no-store\r\n\r\n" + content + b"\r\n"
 
 
@@ -1628,14 +1679,13 @@ class CameraStreamWorker:
 
     def mjpeg_frames(self):
         self.start()
-        last_seq = 0
+        last_sync_seq = 0
         while True:
+            sync_seq, _ = wait_sync_tick(last_sync_seq)
+            last_sync_seq = sync_seq
             with self.condition:
-                self.condition.wait_for(lambda: self.seq != last_seq or bool(self.error), timeout=1.0)
-                seq = self.seq
                 jpeg = self.jpeg
-            if jpeg and seq != last_seq:
-                last_seq = seq
+            if jpeg:
                 yield b"--frame\r\nContent-Type: image/jpeg\r\nCache-Control: no-store\r\n\r\n" + jpeg + b"\r\n"
             else:
                 time.sleep(0.01)
@@ -1676,6 +1726,7 @@ def stream_camera(camera_id: str) -> StreamingResponse:
 @app.on_event("startup")
 def start_ros_monitor() -> None:
     global _ROS_MONITOR
+    start_sync_clock()
     robot_id = os.getenv("FMS_ROBOT", "unitree")
     _ROS_MONITOR = RosMonitor(robot_id)
     _ROS_MONITOR.start()

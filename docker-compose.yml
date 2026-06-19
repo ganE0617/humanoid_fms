@@ -13,6 +13,7 @@ services:
       FMS_PORT: "8787"
       FMS_ENABLE_ROS: "1"
       FMS_ROBOT: "unitree"
+      FMS_CAMERA_SYNC_FPS: "20"
       ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-0}"
       RMW_IMPLEMENTATION: "${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
       CYCLONEDDS_URI: "${CYCLONEDDS_URI:-<CycloneDDS><Domain><General><AllowMulticast>true</AllowMulticast></General></Domain></CycloneDDS>}"
