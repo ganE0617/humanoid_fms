@@ -14,6 +14,13 @@ const state = {
   depthState: null,
   missionState: null,
   depthRgbOverlay: false,
+  cameraSync: {
+    timer: null,
+    controller: null,
+    tick: 0,
+    urls: new Map(),
+    fps: 15,
+  },
   stableRobotState: {
     joints: {},
     transforms: [],
@@ -72,6 +79,11 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
+function cssEscape(value) {
+  if (window.CSS?.escape) return CSS.escape(String(value));
+  return String(value).replace(/["\\]/g, "\\$&");
+}
+
 function fetchJson(path) {
   return fetch(path, { cache: "no-store" }).then((response) => {
     if (!response.ok) throw new Error(`${path} ${response.status}`);
@@ -103,6 +115,7 @@ async function boot() {
   renderRobotSelect();
   renderTopicMap();
   renderCameraGrid();
+  startCameraSync();
   setupInteractions();
   updateDepthRgbToggle();
   loadUrdf();
@@ -494,8 +507,8 @@ function renderCameraGrid() {
           </div>
           ${
             isDepthView
-              ? `<img id="depth-view" class="camera-stream depth-view-image" src="/stream/depth-view" alt="${escapeHtml(cam.label)} view" onerror="this.classList.add('hidden'); this.parentElement.querySelector('.camera-empty').style.display='grid';" />`
-              : `<img class="camera-stream" src="/stream/${cam.id}" alt="${escapeHtml(cam.label)} stream" onerror="this.classList.add('hidden'); this.parentElement.querySelector('.camera-empty').style.display='grid';" />`
+              ? `<img id="depth-view" class="camera-stream depth-view-image" data-camera-id="${cam.id}" data-depth-view="1" alt="${escapeHtml(cam.label)} view" />`
+              : `<img class="camera-stream" data-camera-id="${cam.id}" alt="${escapeHtml(cam.label)} stream" />`
           }
           <div class="camera-empty" style="display:none">
             <div>
@@ -537,6 +550,98 @@ function renderCameraGrid() {
       },
     )
     .join("");
+}
+
+function cameraFrameUrl(cam, tick) {
+  const isDepthView = cam.id === "aux_4" || String(cam.role || "") === "depth-z16";
+  const path = isDepthView ? "/api/depth-view.jpg" : `/api/camera-frame/${encodeURIComponent(cam.id)}.jpg`;
+  return `${path}?tick=${tick}`;
+}
+
+function setCameraEmpty(img, show) {
+  const card = img?.closest(".camera-card");
+  const empty = card?.querySelector(".camera-empty");
+  if (!img || !empty) return;
+  img.classList.toggle("hidden", show);
+  empty.style.display = show ? "grid" : "none";
+}
+
+async function fetchCameraBlob(cam, tick, signal) {
+  const response = await fetch(cameraFrameUrl(cam, tick), {
+    cache: "no-store",
+    signal,
+  });
+  if (!response.ok) throw new Error(`${cam.id} ${response.status}`);
+  const blob = await response.blob();
+  return {
+    cam,
+    blob,
+    stamp: Number(response.headers.get("X-FMS-Frame-Stamp") || 0),
+    age: Number(response.headers.get("X-FMS-Frame-Age") || 0),
+    seq: Number(response.headers.get("X-FMS-Frame-Seq") || 0),
+  };
+}
+
+function displayCameraFrame(frame) {
+  const img = document.querySelector(`img[data-camera-id="${cssEscape(frame.cam.id)}"]`);
+  if (!img || !frame.blob?.size) return;
+  const oldUrl = state.cameraSync.urls.get(frame.cam.id);
+  const url = URL.createObjectURL(frame.blob);
+  state.cameraSync.urls.set(frame.cam.id, url);
+  img.onload = () => {
+    if (oldUrl) URL.revokeObjectURL(oldUrl);
+  };
+  img.src = url;
+  img.dataset.frameStamp = String(frame.stamp || "");
+  img.dataset.frameAge = String(frame.age || "");
+  img.dataset.frameSeq = String(frame.seq || "");
+  setCameraEmpty(img, false);
+}
+
+async function syncCameraFrames() {
+  if (!state.config?.cameras?.length) return;
+  if (state.cameraSync.controller) {
+    state.cameraSync.controller.abort();
+  }
+  const controller = new AbortController();
+  state.cameraSync.controller = controller;
+  const tick = state.cameraSync.tick + 1;
+  state.cameraSync.tick = tick;
+  const started = performance.now();
+  const requests = state.config.cameras.map((cam) =>
+    fetchCameraBlob(cam, tick, controller.signal)
+      .then((frame) => ({ ok: true, frame }))
+      .catch((error) => ({ ok: false, cam, error })),
+  );
+  const results = await Promise.all(requests);
+  if (controller.signal.aborted || tick !== state.cameraSync.tick) return;
+  const frames = results.filter((result) => result.ok).map((result) => result.frame);
+  requestAnimationFrame(() => {
+    if (tick !== state.cameraSync.tick) return;
+    frames.forEach(displayCameraFrame);
+    results
+      .filter((result) => !result.ok && result.error?.name !== "AbortError")
+      .forEach((result) => {
+        const img = document.querySelector(`img[data-camera-id="${cssEscape(result.cam.id)}"]`);
+        if (!img?.src) setCameraEmpty(img, true);
+      });
+    const elapsed = performance.now() - started;
+    if (elapsed > 140) {
+      state.cameraSync.fps = Math.max(10, state.cameraSync.fps - 1);
+    } else if (elapsed < 70) {
+      state.cameraSync.fps = Math.min(20, state.cameraSync.fps + 0.25);
+    }
+  });
+}
+
+function startCameraSync() {
+  if (state.cameraSync.timer) clearTimeout(state.cameraSync.timer);
+  const loop = () => {
+    syncCameraFrames().catch(() => {});
+    const interval = Math.round(1000 / state.cameraSync.fps);
+    state.cameraSync.timer = setTimeout(loop, interval);
+  };
+  loop();
 }
 
 async function refreshStatus() {

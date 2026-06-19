@@ -33,4 +33,4 @@ echo "URL: http://${HOST}:${PORT}"
 echo "Scope: local-only"
 echo "CycloneDDS: ${FMS_CYCLONEDDS_INTERFACE:-auto}"
 
-exec python3 -m uvicorn fms_server:app --host "$HOST" --port "$PORT"
+exec python3 -m uvicorn fms_server:app --host "$HOST" --port "$PORT" --no-access-log

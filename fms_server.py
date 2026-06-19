@@ -1513,9 +1513,19 @@ def get_depth_view() -> Response:
         raise HTTPException(status_code=404, detail="depth monitor not started")
     with _ROS_MONITOR.lock:
         content = _ROS_MONITOR.depth_view_jpg
+        stamp = _ROS_MONITOR.last_depth_time
     if not content:
         raise HTTPException(status_code=404, detail="depth view unavailable")
-    return Response(content=content, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+    return Response(
+        content=content,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "X-FMS-Frame-Stamp": f"{stamp:.6f}" if stamp else "0",
+            "X-FMS-Frame-Age": f"{max(0.0, time.time() - stamp):.3f}" if stamp else "0",
+        },
+    )
 
 
 def depth_view_mjpeg_frames():
@@ -1677,6 +1687,15 @@ class CameraStreamWorker:
                 return None, self.stamp
             return self.frame.copy(), self.stamp
 
+    def latest_jpeg(self, max_age: float = 0.35, wait_timeout: float = 0.0) -> tuple[bytes, float, int]:
+        self.start()
+        with self.condition:
+            if wait_timeout > 0 and not self.jpeg:
+                self.condition.wait_for(lambda: bool(self.jpeg), timeout=wait_timeout)
+            if not self.jpeg or not self.stamp or time.time() - self.stamp > max_age:
+                return b"", self.stamp, self.seq
+            return self.jpeg, self.stamp, self.seq
+
     def mjpeg_frames(self):
         self.start()
         last_sync_seq = 0
@@ -1708,6 +1727,32 @@ def latest_camera_frame(camera_id: str, max_age: float = 0.35) -> tuple[np.ndarr
     if not cam:
         return None, 0.0
     return camera_worker(cam).latest_frame(max_age=max_age)
+
+
+@app.get("/api/camera-frame/{camera_id}.jpg")
+def get_camera_frame(camera_id: str) -> Response:
+    cams = {cam["id"]: cam for cam in camera_config()}
+    cam = cams.get(camera_id)
+    if not cam:
+        raise HTTPException(status_code=404, detail="unknown camera")
+    if not Path(cam["device"]).exists():
+        raise HTTPException(status_code=404, detail=f"camera device missing: {cam['device']}")
+    if str(cam.get("role", "")) == "depth-z16":
+        return get_depth_view()
+    jpeg, stamp, seq = camera_worker(cam).latest_jpeg(max_age=0.45, wait_timeout=0.25)
+    if not jpeg:
+        raise HTTPException(status_code=503, detail=f"camera frame unavailable: {cam['id']}")
+    return Response(
+        content=jpeg,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "X-FMS-Frame-Seq": str(seq),
+            "X-FMS-Frame-Stamp": f"{stamp:.6f}" if stamp else "0",
+            "X-FMS-Frame-Age": f"{max(0.0, time.time() - stamp):.3f}" if stamp else "0",
+        },
+    )
 
 
 @app.get("/stream/{camera_id}")
