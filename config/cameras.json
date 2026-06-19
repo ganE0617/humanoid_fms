@@ -27,7 +27,7 @@
     "role": "depth-rgb",
     "device": "/dev/realsense_camera",
     "captureCandidates": ["/dev/realsense_camera", "/dev/video6", "/dev/video8"],
-    "resolution": [640, 360],
+    "resolution": [640, 480],
     "fps": 30,
     "jpegQuality": 88,
     "fov": 87
@@ -38,7 +38,7 @@
     "role": "depth-z16",
     "device": "/dev/video4",
     "captureCandidates": ["/dev/video4"],
-    "resolution": [640, 360],
+    "resolution": [640, 480],
     "fps": 30,
     "jpegQuality": 88,
     "fov": 87

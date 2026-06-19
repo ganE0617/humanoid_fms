@@ -760,7 +760,10 @@ def depth_view_from_z16(frame: np.ndarray, config: dict[str, Any], color_frame: 
     depth_m = frame.astype(np.float32) * scale
     valid = (frame > 0) & (frame < 65535) & (depth_m >= near) & (depth_m <= far)
 
-    target_aspect = 16 / 9
+    target_width, target_height = config.get("depthViewResolution", [640, 480])
+    target_width = int(target_width)
+    target_height = int(target_height)
+    target_aspect = target_width / max(1, target_height)
     depth_crop = crop_to_aspect(depth_m, target_aspect)
     valid_crop = crop_to_aspect(valid.astype(np.uint8), target_aspect).astype(bool)
 
@@ -770,8 +773,7 @@ def depth_view_from_z16(frame: np.ndarray, config: dict[str, Any], color_frame: 
     color = cv2.applyColorMap(inverse, cv2.COLORMAP_TURBO)
     color[~valid_crop] = (10, 14, 19)
 
-    target_width, target_height = config.get("depthViewResolution", [640, 360])
-    target_size = (int(target_width), int(target_height))
+    target_size = (target_width, target_height)
     view = cv2.resize(color, target_size, interpolation=cv2.INTER_CUBIC)
     mask = cv2.resize(valid_crop.astype(np.uint8), target_size, interpolation=cv2.INTER_NEAREST).astype(bool)
     shift_y = int(config.get("depthViewShiftY", 0))

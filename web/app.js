@@ -481,7 +481,7 @@ function renderCameraGrid() {
       (cam, index) => {
         const isDepthView = cam.id === "aux_4" || String(cam.role || "") === "depth-z16";
         return `
-        <article class="camera-card ${isDepthView ? "is-depth-view" : ""}" id="cam-${cam.id}">
+        <article class="camera-card ${isDepthView ? "is-depth-view" : ""}" id="cam-${cam.id}" style="--camera-aspect: ${Number(cam.resolution?.[0] || 16)} / ${Number(cam.resolution?.[1] || 9)}">
           <div class="camera-head">
             <span class="badge">${index + 1}. ${escapeHtml(cam.label)}</span>
             <span class="badge" data-cam-status="${cam.id}">WAIT</span>
