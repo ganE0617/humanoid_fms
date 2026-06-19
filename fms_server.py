@@ -781,7 +781,7 @@ def depth_view_from_z16(frame: np.ndarray, config: dict[str, Any], color_frame: 
         view = cv2.warpAffine(view, matrix, target_size, borderValue=(10, 14, 19))
         mask = cv2.warpAffine(mask.astype(np.uint8), matrix, target_size, flags=cv2.INTER_NEAREST, borderValue=0).astype(bool)
 
-    if color_frame is not None and str(config.get("depthViewMode", "rgb_overlay")) == "rgb_overlay":
+    if color_frame is not None and str(config.get("depthViewMode", "depth_only")) == "rgb_overlay":
         base = crop_to_aspect(color_frame, target_aspect)
         if base.size:
             base = cv2.resize(base, target_size, interpolation=cv2.INTER_AREA)
@@ -1041,7 +1041,7 @@ class RosMonitor:
                 now = time.time()
                 color_frame = None
                 color_camera_id = str(depth.get("depthRgbCameraId", "realsense_rgb"))
-                if color_camera_id:
+                if str(depth.get("depthViewMode", "depth_only")) == "rgb_overlay" and color_camera_id:
                     color_frame, _ = latest_camera_frame(color_camera_id, max_age=0.5)
                 depth_view_jpg = depth_view_from_z16(frame, depth, color_frame=color_frame)
                 assist_interval = max(0.05, float(depth.get("assistUpdateInterval", 0.2)))

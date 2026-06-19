@@ -1233,25 +1233,6 @@ function colorForDepthPoint(point, near, far, objects) {
   return depthColor(Math.hypot(px, py, pz), near, far);
 }
 
-function bboxLinePositions(min, max) {
-  const [x0, y0, z0] = min;
-  const [x1, y1, z1] = max;
-  return [
-    x0, y0, z0, x1, y0, z0,
-    x1, y0, z0, x1, y1, z0,
-    x1, y1, z0, x0, y1, z0,
-    x0, y1, z0, x0, y0, z0,
-    x0, y0, z1, x1, y0, z1,
-    x1, y0, z1, x1, y1, z1,
-    x1, y1, z1, x0, y1, z1,
-    x0, y1, z1, x0, y0, z1,
-    x0, y0, z0, x0, y0, z1,
-    x1, y0, z0, x1, y0, z1,
-    x1, y1, z0, x1, y1, z1,
-    x0, y1, z0, x0, y1, z1,
-  ];
-}
-
 function updateDepthGeometry() {
   const { depthPoints, depthSurface, depthFrustum, depthObjectMarkers } = state.mesh;
   if (!depthPoints || !depthSurface || !depthFrustum || !depthObjectMarkers) return;
@@ -1373,23 +1354,6 @@ function updateDepthGeometry() {
     depthObjectMarkers.remove(child);
     disposeRuntimeObject(child);
   });
-  objects.forEach((object) => {
-    const color = objectColor(object.id, objects) || [1, 1, 1];
-    const lineMaterial = new THREE.LineBasicMaterial({
-      color: new THREE.Color(color[0], color[1], color[2]),
-      transparent: true,
-      opacity: 0.95,
-      depthTest: false,
-    });
-    if (Array.isArray(object.bboxMin) && Array.isArray(object.bboxMax)) {
-      const geometry = new THREE.BufferGeometry();
-      geometry.setAttribute("position", new THREE.Float32BufferAttribute(bboxLinePositions(object.bboxMin, object.bboxMax), 3));
-      const box = new THREE.LineSegments(geometry, lineMaterial);
-      box.renderOrder = 8;
-      depthObjectMarkers.add(box);
-    }
-  });
-
   const primary = objects[0];
   if (primary) {
     const size = Array.isArray(primary.size) ? primary.size.map((value) => Number(value).toFixed(2)).join("x") : "";
