@@ -14,9 +14,10 @@ services:
       FMS_ENABLE_ROS: "1"
       FMS_ROBOT: "unitree"
       FMS_CAMERA_SYNC_FPS: "20"
+      FMS_CYCLONEDDS_INTERFACE: "${FMS_CYCLONEDDS_INTERFACE:-}"
       ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-0}"
       RMW_IMPLEMENTATION: "${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
-      CYCLONEDDS_URI: "${CYCLONEDDS_URI:-<CycloneDDS><Domain><General><AllowMulticast>true</AllowMulticast></General></Domain></CycloneDDS>}"
+      CYCLONEDDS_URI: "${CYCLONEDDS_URI:-}"
     volumes:
       - ./config:/app/config:ro
       - ./web:/app/web:ro

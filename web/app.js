@@ -137,6 +137,9 @@ function renderRobotSelect() {
     state.robotId = select.value;
     setText("#robot-pill", robots[state.robotId].label);
     renderTopicMap();
+    state.mesh.controls.depthFitDone = false;
+    updateDepthGeometry();
+    updateDepthPose();
     loadUrdf();
   });
   setText("#robot-pill", robots[state.robotId].label);
@@ -902,7 +905,7 @@ function buildSceneFrames() {
 function depthFrameMatrix() {
   if (!state.urdf) return null;
   const depth = state.depthState || {};
-  const config = depth.config || state.config?.robots?.[state.robotId]?.depthSensor || {};
+  const config = state.config?.robots?.[state.robotId]?.depthSensor || depth.config || {};
   const frames = buildSceneFrames();
   const frame = normalizeFrameId(depth.frameId);
   if (frame && frames.has(frame)) return frames.get(frame);
@@ -1083,7 +1086,7 @@ function bindSceneControls(canvas) {
     const controls = state.mesh.controls;
     controls.userInteracted = true;
     controls.pointerId = event.pointerId;
-    controls.mode = event.button === 2 || event.shiftKey ? "pan" : "rotate";
+    controls.mode = event.button === 2 || event.shiftKey || event.altKey ? "rotate" : "pan";
     controls.lastX = event.clientX;
     controls.lastY = event.clientY;
     canvas.setPointerCapture(event.pointerId);
@@ -1264,7 +1267,7 @@ function updateDepthGeometry() {
   const { depthPoints, depthSurface, depthFrustum, depthObjectMarkers } = state.mesh;
   if (!depthPoints || !depthSurface || !depthFrustum || !depthObjectMarkers) return;
   const depth = state.depthState || {};
-  const config = depth.config || state.config?.robots?.[state.robotId]?.depthSensor || {};
+  const config = state.config?.robots?.[state.robotId]?.depthSensor || depth.config || {};
   const objects = Array.isArray(depth.objects) ? depth.objects : [];
   const near = Number(config.nearMeters || 0.18);
   const far = Number(config.focusFarMeters || config.farMeters || 1.05);
