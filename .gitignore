@@ -9,3 +9,6 @@ logs/
 *.log
 vendor/
 
+*.bak
+*.bak.*
+*.orig

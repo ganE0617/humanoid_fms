@@ -5,21 +5,24 @@ import { STLLoader } from "/lib/STLLoader.js";
 const state = {
   config: null,
   status: null,
-  robotId: "unitree",
-  armed: false,
-  drive: { linear: 0, angular: 0 },
+  robotId: "ai_worker",
   lastStatusAt: 0,
   urdf: null,
   robotState: null,
   depthState: null,
   missionState: null,
+  missionNotice: null,
+  missionNoticeTimer: null,
+  audioState: null,
   depthRgbOverlay: false,
   cameraSync: {
     timer: null,
     controller: null,
+    inFlight: false,
     tick: 0,
     urls: new Map(),
     fps: 15,
+    toleranceMs: 150,
   },
   stableRobotState: {
     joints: {},
@@ -35,7 +38,9 @@ const state = {
     root: null,
     depthGroup: null,
     depthPoints: null,
+    depthSurfaceFill: null,
     depthSurface: null,
+    depthSurfaceWire: null,
     depthFrustum: null,
     depthObjectMarkers: null,
     controls: {
@@ -110,25 +115,29 @@ function statusClass(cam) {
 
 async function boot() {
   state.config = await fetchJson("/api/config");
+  state.robotId = state.config.defaultRobot || "ai_worker";
   state.depthRgbOverlay = localStorage.getItem("fmsDepthRgbOverlay") === "1";
-  initMeshViewer();
-  renderRobotSelect();
-  renderTopicMap();
+  setText("#robot-pill", state.config.robots?.[state.robotId]?.label || state.robotId);
   renderCameraGrid();
-  startCameraSync();
   setupInteractions();
   updateDepthRgbToggle();
-  loadUrdf();
   await refreshStatus();
+  startCameraSync();
+  const meshReady = initMeshViewerSafe();
+  if (meshReady) {
+    loadUrdf();
+    requestAnimationFrame(renderScene);
+  }
   await refreshRobotState();
   await refreshDepthState();
   await refreshMissionState();
+  await refreshAudioState();
   setInterval(refreshStatus, 2500);
   setInterval(refreshRobotState, 80);
   setInterval(refreshDepthState, 800);
   setInterval(refreshMissionState, 1000);
+  setInterval(refreshAudioState, 2000);
   setInterval(updateClock, 500);
-  requestAnimationFrame(renderScene);
 }
 
 function updateClock() {
@@ -368,17 +377,194 @@ async function sendMissionSignal(signal) {
 
 function renderMissionPanel() {
   const mission = state.missionState || { stage: "idle", events: [] };
-  const stage = String(mission.stage || "idle").toUpperCase();
-  setText("#mission-stage", stage);
-  setText("#mission-topic", mission.topic || "/fms/mission_events");
-  const last = (mission.events || []).at(-1);
-  const label = last
-    ? `${last.label || last.signal} #${last.seq} ${new Date(last.time * 1000).toLocaleTimeString("en-GB", { hour12: false })}`
-    : "waiting";
+  const machine = mission.machineState || {};
+  const machineState = Number(machine.state ?? 0);
+  const isOk = machineState === 1;
+  const stageEl = $("#mission-stage");
+  const okSign = $("#mission-ok");
+  setText("#mission-stage", "MISSION OK");
+  if (stageEl) stageEl.hidden = !isOk;
+  if (okSign) okSign.hidden = isOk;
+  setText("#mission-topic", machine.service || "/machine_state");
+  const rosTimes = [Number(machine.updated || 0)].filter((value) => value > 0);
+  const latestRos = rosTimes.length ? Math.max(...rosTimes) : 0;
+  const notice = state.missionNotice && state.missionNotice.until > Date.now() ? state.missionNotice : null;
+  const label = notice
+    ? notice.text
+    : latestRos
+      ? `ROS ${new Date(latestRos * 1000).toLocaleTimeString("en-GB", { hour12: false })}`
+      : "waiting for ROS";
   setText("#mission-last", label);
   const panel = $(".mission-panel");
   if (panel) {
-    panel.dataset.stage = mission.stage || "idle";
+    panel.dataset.stage = isOk ? "ok" : "idle";
+    panel.dataset.machineState = isOk ? "1" : "0";
+    panel.dataset.notice = notice ? "1" : "0";
+  }
+}
+
+function showMissionNotice(text) {
+  state.missionNotice = { text, until: Date.now() + 3000 };
+  if (state.missionNoticeTimer) clearTimeout(state.missionNoticeTimer);
+  renderMissionPanel();
+  state.missionNoticeTimer = setTimeout(() => {
+    state.missionNotice = null;
+    state.missionNoticeTimer = null;
+    renderMissionPanel();
+  }, 3000);
+}
+
+function handleMissionHotkey(event) {
+  if (event.defaultPrevented || event.repeat || event.metaKey || event.ctrlKey || event.altKey) return;
+  const target = event.target;
+  const tag = target?.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA" || target?.isContentEditable) return;
+  if (event.code === "F9") {
+    event.preventDefault();
+    showMissionNotice("B\uad6c\uac04 \uc774\ub3d9 Start");
+  } else if (event.code === "F10") {
+    event.preventDefault();
+    showMissionNotice("B\uad6c\uac04 \uc774\ub3d9 Finish");
+  }
+}
+
+
+async function refreshAudioState() {
+  try {
+    state.audioState = await fetchJson("/api/audio");
+    renderAudioPanel();
+  } catch (error) {
+    setText("#audio-state", "OFFLINE");
+    setText("#audio-device", "audio API offline");
+  }
+}
+
+function formatBytes(value) {
+  const size = Number(value || 0);
+  if (size >= 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)} MB`;
+  if (size >= 1024) return `${Math.round(size / 1024)} KB`;
+  return `${size} B`;
+}
+
+function formatAudioTime(value) {
+  const time = Number(value || 0);
+  return time > 0 ? new Date(time * 1000).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false }) : "--:--";
+}
+
+function formatFileCount(count) {
+  return `${count} file${count === 1 ? "" : "s"}`;
+}
+
+function renderAudioPanel() {
+  const audio = state.audioState || {};
+  const files = audio.files || [];
+  const current = audio.current || "";
+  setText("#audio-state", audio.playing ? "PLAYING" : "READY");
+  const device = audio.devices?.defaultDevice || "plughw:1,0";
+  const labels = audio.devices?.alsa || [];
+  const match = labels.find((item) => item.alsa === device);
+  setText("#audio-device", match ? `${match.alsa} · ${match.label}` : device);
+  setText("#audio-count", formatFileCount(files.length));
+  const list = $("#audio-list");
+  if (!list) return;
+  list.innerHTML = files.length
+    ? files
+        .map(
+          (file) => `
+            <div class="audio-row ${file.name === current ? "active" : ""}">
+              <div class="audio-file-mark"></div>
+              <div class="audio-file-info">
+                <b title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</b>
+                <span>${formatBytes(file.size)} · ${formatAudioTime(file.modified)}</span>
+              </div>
+              <div class="audio-row-actions">
+                <button
+                  ${file.name === current ? `data-audio-stop="${escapeHtml(file.name)}"` : `data-audio-play="${escapeHtml(file.name)}"`}
+                  class="${file.name === current ? "active stop" : ""}"
+                  type="button"
+                >
+                  ${file.name === current ? "STOP" : "PLAY"}
+                </button>
+                <button
+                  data-audio-delete="${escapeHtml(file.name)}"
+                  class="delete"
+                  type="button"
+                  title="Delete ${escapeHtml(file.name)}"
+                >
+                  DEL
+                </button>
+              </div>
+            </div>
+          `,
+        )
+        .join("")
+    : `<div class="audio-empty">No MP3 files</div>`;
+  list.querySelectorAll("[data-audio-play]").forEach((button) => {
+    button.addEventListener("click", () => playAudio(button.dataset.audioPlay));
+  });
+  list.querySelectorAll("[data-audio-stop]").forEach((button) => {
+    button.addEventListener("click", stopAudio);
+  });
+  list.querySelectorAll("[data-audio-delete]").forEach((button) => {
+    button.addEventListener("click", () => deleteAudio(button.dataset.audioDelete));
+  });
+}
+
+async function uploadAudio() {
+  const input = $("#audio-file");
+  const files = [...(input?.files || [])];
+  if (!files.length) {
+    setText("#audio-state", "NO FILE");
+    return;
+  }
+  setText("#audio-state", "UPLOADING");
+  try {
+    for (const file of files) {
+      const form = new FormData();
+      form.append("file", file);
+      const response = await fetch("/api/audio/upload", { method: "POST", body: form });
+      if (!response.ok) throw new Error(`/api/audio/upload ${response.status}`);
+    }
+    if (input) input.value = "";
+    setText("#audio-selected", "No file selected");
+    await refreshAudioState();
+  } catch (error) {
+    setText("#audio-state", "UPLOAD ERR");
+    console.error(error);
+  }
+}
+
+async function playAudio(name) {
+  setText("#audio-state", "STARTING");
+  try {
+    state.audioState = await postJson("/api/audio/play", { name });
+    await refreshAudioState();
+  } catch (error) {
+    setText("#audio-state", "PLAY ERR");
+    console.error(error);
+  }
+}
+
+async function stopAudio() {
+  try {
+    state.audioState = await postJson("/api/audio/stop", {});
+    await refreshAudioState();
+  } catch (error) {
+    setText("#audio-state", "STOP ERR");
+    console.error(error);
+  }
+}
+
+async function deleteAudio(name) {
+  if (!name) return;
+  setText("#audio-state", "DELETING");
+  try {
+    state.audioState = await postJson("/api/audio/delete", { name });
+    await refreshAudioState();
+    setText("#audio-state", "READY");
+  } catch (error) {
+    setText("#audio-state", "DELETE ERR");
+    console.error(error);
   }
 }
 
@@ -493,62 +679,92 @@ function renderTopicMap() {
   map.innerHTML = metadata + topics;
 }
 
+const CAMERA_LAYOUT = {
+  realsense_d455: { slot: "primary", order: 1, badgeIndex: 1, size: "primary" },
+  realsense_left: { slot: "lower-left", order: 2, badgeIndex: 2, size: "secondary" },
+  realsense_right: { slot: "lower-right", order: 4, badgeIndex: 4, size: "secondary" },
+  logitech_c922: { slot: "lower-center", order: 3, badgeIndex: 3, size: "secondary" },
+};
+
+function cameraBadgeLabel(cam) {
+  const layout = CAMERA_LAYOUT[cam.id];
+  if (layout?.badgeIndex) return `${layout.badgeIndex}. ${cam.label}`;
+  return cam.label;
+}
+
+function renderCameraCard(cam) {
+  const layout = CAMERA_LAYOUT[cam.id] || { slot: "top" };
+  const isDepthView = cam.id === "aux_4" || String(cam.role || "") === "depth-z16";
+  const displayFilter = String(cam.displayFilter || "none");
+  const style = displayFilter && displayFilter !== "none" ? ` style="--camera-filter:${escapeHtml(displayFilter)}"` : "";
+  return `
+    <article class="camera-card camera-card-${layout.size || "secondary"} ${isDepthView ? "is-depth-view" : ""}" id="cam-${cam.id}" data-slot="${layout.slot}"${style}>
+      <div class="camera-head">
+        <span class="badge">${escapeHtml(cameraBadgeLabel(cam))}</span>
+        <span class="badge" data-cam-status="${cam.id}">WAIT</span>
+      </div>
+      ${
+        isDepthView
+          ? `<img id="depth-view" class="camera-stream depth-view-image" data-camera-id="${cam.id}" data-depth-view="1" alt="${escapeHtml(cam.label)} view" />`
+          : `<img class="camera-stream" data-camera-id="${cam.id}" alt="${escapeHtml(cam.label)} stream" />`
+      }
+      <div class="camera-empty" style="display:none">
+        <div>
+          <b>${escapeHtml(cam.role)}</b>
+          <p>${escapeHtml(cam.device)}</p>
+        </div>
+      </div>
+      ${
+        isDepthView
+          ? `
+            <div class="depth-view-panel">
+              <div class="grasp-assist-head">
+                <span>Depth Assist</span>
+                <strong id="grasp-guidance">NO DEPTH</strong>
+              </div>
+              <div class="depth-distance-line">
+                <span>target</span>
+                <b id="grasp-distance">-- m</b>
+              </div>
+              <div class="grasp-range">
+                <i></i>
+                <em id="grasp-range-marker"></em>
+              </div>
+              <div class="grasp-metrics">
+                <span>nearest <b id="grasp-nearest">--</b></span>
+                <span>valid <b id="grasp-confidence">--</b></span>
+                <span>delta <b id="grasp-delta">--</b></span>
+              </div>
+            </div>
+          `
+          : ""
+      }
+      <div class="camera-foot">
+        <span class="badge">${escapeHtml(cam.device)}</span>
+        <span class="badge">${cam.fov} deg</span>
+      </div>
+    </article>
+  `;
+}
+
 function renderCameraGrid() {
   const grid = $("#camera-grid");
-  grid.innerHTML = state.config.cameras
-    .map(
-      (cam, index) => {
-        const isDepthView = cam.id === "aux_4" || String(cam.role || "") === "depth-z16";
-        return `
-        <article class="camera-card ${isDepthView ? "is-depth-view" : ""}" id="cam-${cam.id}" style="--camera-aspect: ${Number(cam.resolution?.[0] || 16)} / ${Number(cam.resolution?.[1] || 9)}">
-          <div class="camera-head">
-            <span class="badge">${index + 1}. ${escapeHtml(cam.label)}</span>
-            <span class="badge" data-cam-status="${cam.id}">WAIT</span>
-          </div>
-          ${
-            isDepthView
-              ? `<img id="depth-view" class="camera-stream depth-view-image" data-camera-id="${cam.id}" data-depth-view="1" alt="${escapeHtml(cam.label)} view" />`
-              : `<img class="camera-stream" data-camera-id="${cam.id}" alt="${escapeHtml(cam.label)} stream" />`
-          }
-          <div class="camera-empty" style="display:none">
-            <div>
-              <b>${escapeHtml(cam.role)}</b>
-              <p>${escapeHtml(cam.device)}</p>
-            </div>
-          </div>
-          ${
-            isDepthView
-              ? `
-                <div class="depth-view-panel">
-                  <div class="grasp-assist-head">
-                    <span>Depth Assist</span>
-                    <strong id="grasp-guidance">NO DEPTH</strong>
-                  </div>
-                  <div class="depth-distance-line">
-                    <span>target</span>
-                    <b id="grasp-distance">-- m</b>
-                  </div>
-                  <div class="grasp-range">
-                    <i></i>
-                    <em id="grasp-range-marker"></em>
-                  </div>
-                  <div class="grasp-metrics">
-                    <span>nearest <b id="grasp-nearest">--</b></span>
-                    <span>valid <b id="grasp-confidence">--</b></span>
-                    <span>delta <b id="grasp-delta">--</b></span>
-                  </div>
-                </div>
-              `
-              : ""
-          }
-          <div class="camera-foot">
-            <span class="badge">${escapeHtml(cam.device)}</span>
-            <span class="badge">${cam.fov} deg</span>
-          </div>
-        </article>
-      `;
-      },
-    )
+  const cameras = [...(state.config.cameras || [])];
+  const bySlot = Object.fromEntries(
+    cameras.map((cam) => [CAMERA_LAYOUT[cam.id]?.slot || `extra-${cam.id}`, cam]),
+  );
+  const extras = cameras
+    .filter((cam) => !CAMERA_LAYOUT[cam.id])
+    .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  grid.innerHTML = [
+    bySlot.primary,
+    bySlot["lower-left"],
+    bySlot["lower-center"],
+    bySlot["lower-right"],
+    ...extras,
+  ]
+    .filter(Boolean)
+    .map(renderCameraCard)
     .join("");
 }
 
@@ -558,12 +774,93 @@ function cameraFrameUrl(cam, tick) {
   return `${path}?tick=${tick}`;
 }
 
+function webVideoServerBase() {
+  const server = state.config?.runtime?.webVideoServer;
+  if (!server?.enabled) return "";
+  return window.location.origin;
+}
+
+function webVideoTopic(cam) {
+  return cam.webVideoTopic || cam.resolved || cam.ros?.topic || cam.device || "";
+}
+
+function usesWebVideoStream(cam) {
+  return false;
+}
+
+function webVideoStreamUrl(cam) {
+  return `${webVideoServerBase()}/stream/${encodeURIComponent(cam.id)}`;
+}
+
+function bindCameraStreamFallback(img, url) {
+  if (!img || img.dataset.streamBound === "1") return;
+  img.dataset.streamBound = "1";
+  img.addEventListener("load", () => {
+    if (img.dataset.streamUrl) {
+      img.dataset.streamFailed = "0";
+    }
+  });
+  img.addEventListener("error", () => {
+    img.dataset.streamFailed = "1";
+    img.dataset.streamUrl = "";
+    img.removeAttribute("src");
+    setCameraEmpty(img, true);
+  });
+  window.setTimeout(() => {
+    if (img.dataset.streamUrl !== url || img.dataset.streamFailed === "1") return;
+    if (!img.naturalWidth || !img.naturalHeight) {
+      img.dataset.streamFailed = "1";
+      img.dataset.streamUrl = "";
+      img.removeAttribute("src");
+    }
+  }, 2500);
+}
+
 function setCameraEmpty(img, show) {
   const card = img?.closest(".camera-card");
   const empty = card?.querySelector(".camera-empty");
   if (!img || !empty) return;
   img.classList.toggle("hidden", show);
   empty.style.display = show ? "grid" : "none";
+}
+
+function cameraUnavailableText(cam) {
+  if (cam.source === "ros") {
+    const topic = cam.resolved || cam.ros?.topic || cam.device || "-";
+    const detail = cam.ros?.error || "ROS publisher not detected";
+    return { title: cam.role || "ros camera", detail, topic };
+  }
+  return { title: cam.role || "camera", detail: cam.busy ? "device busy" : "device missing", topic: cam.device || "-" };
+}
+
+function updateCameraEmptyState(cam) {
+  const card = document.querySelector(`#cam-${cssEscape(cam.id)}`);
+  const img = card?.querySelector("img.camera-stream");
+  const empty = card?.querySelector(".camera-empty");
+  if (!card || !img || !empty) return;
+  if (usesWebVideoStream(cam) && !cam.busy) {
+    const url = webVideoStreamUrl(cam);
+    bindCameraStreamFallback(img, url);
+    if (img.dataset.streamUrl !== url) {
+      img.dataset.streamFailed = "0";
+      img.src = url;
+      img.dataset.streamUrl = url;
+    }
+    setCameraEmpty(img, false);
+    return;
+  }
+  const show = !cam.exists || cam.busy;
+  if (show) {
+    const message = cameraUnavailableText(cam);
+    empty.innerHTML = `
+      <div>
+        <b>${escapeHtml(message.title)}</b>
+        <p>${escapeHtml(message.detail)}</p>
+        <code>${escapeHtml(message.topic)}</code>
+      </div>
+    `;
+  }
+  setCameraEmpty(img, show);
 }
 
 async function fetchCameraBlob(cam, tick, signal) {
@@ -600,38 +897,54 @@ function displayCameraFrame(frame) {
 
 async function syncCameraFrames() {
   if (!state.config?.cameras?.length) return;
-  if (state.cameraSync.controller) {
-    state.cameraSync.controller.abort();
-  }
+  if (state.cameraSync.inFlight) return;
+  const liveCameraIds = new Set(
+    (state.status?.cameras || [])
+      .filter((cam) => cam.exists || cam.ros?.live)
+      .map((cam) => cam.id),
+  );
+  const cameras = liveCameraIds.size
+    ? state.config.cameras.filter((cam) => liveCameraIds.has(cam.id))
+    : state.config.cameras;
+  const pollCameras = cameras.filter((cam) => !usesWebVideoStream(cam));
+  if (!pollCameras.length) return;
   const controller = new AbortController();
   state.cameraSync.controller = controller;
+  state.cameraSync.inFlight = true;
   const tick = state.cameraSync.tick + 1;
   state.cameraSync.tick = tick;
   const started = performance.now();
-  const requests = state.config.cameras.map((cam) =>
+  const requests = pollCameras.map((cam) =>
     fetchCameraBlob(cam, tick, controller.signal)
       .then((frame) => ({ ok: true, frame }))
       .catch((error) => ({ ok: false, cam, error })),
   );
-  const results = await Promise.all(requests);
-  if (controller.signal.aborted || tick !== state.cameraSync.tick) return;
-  const frames = results.filter((result) => result.ok).map((result) => result.frame);
-  requestAnimationFrame(() => {
-    if (tick !== state.cameraSync.tick) return;
-    frames.forEach(displayCameraFrame);
-    results
-      .filter((result) => !result.ok && result.error?.name !== "AbortError")
-      .forEach((result) => {
-        const img = document.querySelector(`img[data-camera-id="${cssEscape(result.cam.id)}"]`);
-        if (!img?.src) setCameraEmpty(img, true);
-      });
-    const elapsed = performance.now() - started;
-    if (elapsed > 140) {
-      state.cameraSync.fps = Math.max(10, state.cameraSync.fps - 1);
-    } else if (elapsed < 70) {
-      state.cameraSync.fps = Math.min(20, state.cameraSync.fps + 0.25);
+  try {
+    const results = await Promise.all(requests);
+    if (controller.signal.aborted || tick !== state.cameraSync.tick) return;
+    const frames = results.filter((result) => result.ok).map((result) => result.frame);
+    requestAnimationFrame(() => {
+      if (tick !== state.cameraSync.tick) return;
+      frames.forEach(displayCameraFrame);
+      results
+        .filter((result) => !result.ok && result.error?.name !== "AbortError")
+        .forEach((result) => {
+          const img = document.querySelector(`img[data-camera-id="${cssEscape(result.cam.id)}"]`);
+          if (!img?.src) setCameraEmpty(img, true);
+        });
+      const elapsed = performance.now() - started;
+      if (elapsed > 180) {
+        state.cameraSync.fps = Math.max(10, state.cameraSync.fps - 1);
+      } else if (elapsed < 90) {
+        state.cameraSync.fps = Math.min(20, state.cameraSync.fps + 0.25);
+      }
+    });
+  } finally {
+    if (state.cameraSync.controller === controller) {
+      state.cameraSync.controller = null;
     }
-  });
+    state.cameraSync.inFlight = false;
+  }
 }
 
 function startCameraSync() {
@@ -656,6 +969,7 @@ async function refreshStatus() {
 }
 
 function renderStatus() {
+  renderBatterySummary();
   renderCameraStatus();
   renderRosStatus();
   renderDockerStatus();
@@ -668,9 +982,17 @@ function renderCameraStatus() {
 
   cams.forEach((cam) => {
     const node = document.querySelector(`[data-cam-status="${cam.id}"]`);
-    if (!node) return;
-    node.className = `badge ${statusClass(cam)}`;
-    node.textContent = !cam.exists ? "MISSING" : cam.busy ? "BUSY" : "READY";
+    const card = document.querySelector(`#cam-${cssEscape(cam.id)}`);
+    const width = Number(cam.resolution?.[0] || 0);
+    const height = Number(cam.resolution?.[1] || 0);
+    if (card && width > 0 && height > 0) {
+      card.style.setProperty("--camera-aspect", `${width} / ${height}`);
+    }
+    if (node) {
+      node.className = `badge ${statusClass(cam)}`;
+      node.textContent = !cam.exists ? "MISSING" : cam.busy ? "BUSY" : "READY";
+    }
+    updateCameraEmptyState(cam);
   });
 
   $("#tab-cameras").innerHTML = cams
@@ -694,17 +1016,20 @@ function renderCameraStatus() {
 
 function renderRosStatus() {
   const ros = state.status.ros || { available: false, topics: [] };
+  const batteryHtml = renderBatteryStatus(ros.battery, state.config?.robots?.[state.robotId]?.topics || {}, ros.topics || []);
   if (!ros.available) {
     $("#tab-ros").innerHTML = `
+      ${batteryHtml}
       <div class="status-row">
         <b>ROS 2 host CLI unavailable</b>
-        <code>source /opt/ros/humble/setup.bash or bridge through container</code>
+        <code>source /opt/ros/jazzy/setup.bash or bridge through container</code>
       </div>
       ${renderExpectedTopics()}
     `;
     return;
   }
   $("#tab-ros").innerHTML =
+    batteryHtml +
     `<div class="status-row"><b>${ros.count} topics detected</b><code>ros2 topic list -t</code></div>` +
     ros.topics
       .slice(0, 38)
@@ -717,6 +1042,78 @@ function renderRosStatus() {
         `,
       )
       .join("");
+}
+
+function batteryStatusClass(battery) {
+  const percent = Number(battery?.percentage);
+  if (!battery?.live) return "warn";
+  if (Number.isFinite(percent) && percent <= 15) return "bad";
+  if (Number.isFinite(percent) && percent <= 30) return "warn";
+  return "good";
+}
+
+function formatBatteryValue(value, suffix = "") {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number}${suffix}` : "-";
+}
+
+function expectedBatteryItems(topics = {}) {
+  return [
+    { label: "Left Battery", topic: topics.batteryLeft || "/ai_worker/battery/left/state" },
+    { label: "Right Battery", topic: topics.batteryRight || "/ai_worker/battery/right/state" },
+  ];
+}
+
+function renderBatteryCard(battery = {}) {
+  const status = battery.live ? battery.powerSupplyStatusText || "live" : battery.connected ? "connected" : "waiting";
+  const percent = formatBatteryValue(battery.percentage, "%");
+  const voltage = formatBatteryValue(battery.voltage, "V");
+  const current = formatBatteryValue(battery.current, "A");
+  const temperature = formatBatteryValue(battery.temperature, "C");
+  return `
+    <div class="status-row">
+      <div class="split-line"><b>${escapeHtml(battery.label || "Battery")}</b><span class="${batteryStatusClass(battery)}">${escapeHtml(status)}</span></div>
+      <div class="split-line"><span>topic</span><span>${escapeHtml(battery.topic || "/battery_state")}</span></div>
+      <div class="split-line"><span>charge</span><span>${escapeHtml(percent)}</span></div>
+      <div class="split-line"><span>voltage</span><span>${escapeHtml(voltage)}</span></div>
+      <div class="split-line"><span>current</span><span>${escapeHtml(current)}</span></div>
+      <div class="split-line"><span>temperature</span><span>${escapeHtml(temperature)}</span></div>
+    </div>
+  `;
+}
+
+function batteryItems(battery = {}, topics = {}, rosTopics = []) {
+  const visibleTopics = new Set((rosTopics || []).map((topic) => topic.name));
+  const byTopic = new Map((battery.batteries || []).map((item) => [item.topic, item]));
+  return expectedBatteryItems(topics).map((expected) => ({
+    ...expected,
+    connected: visibleTopics.has(expected.topic),
+    ...(byTopic.get(expected.topic) || {}),
+  }));
+}
+
+function renderBatteryStatus(battery = {}, topics = {}, rosTopics = []) {
+  const items = batteryItems(battery, topics, rosTopics);
+  return items.map(renderBatteryCard).join("");
+}
+
+function renderBatterySummary() {
+  const node = $("#battery-summary");
+  if (!node) return;
+  const ros = state.status?.ros || {};
+  const topics = state.config?.robots?.[state.robotId]?.topics || {};
+  node.innerHTML = batteryItems(ros.battery || {}, topics, ros.topics || [])
+    .map((battery) => {
+      const status = battery.live ? battery.powerSupplyStatusText || "live" : battery.connected ? "connected" : "waiting";
+      const percent = formatBatteryValue(battery.percentage, "%");
+      return `
+        <div class="battery-chip">
+          <b>${escapeHtml(battery.label || "Battery")}</b>
+          <span class="${batteryStatusClass(battery)}">${escapeHtml(percent)} ${escapeHtml(status)}</span>
+        </div>
+      `;
+    })
+    .join("");
 }
 
 function renderExpectedTopics() {
@@ -762,7 +1159,8 @@ function renderDockerStatus() {
 }
 
 function setupInteractions() {
-  $("#refresh-btn").addEventListener("click", refreshStatus);
+  $("#refresh-btn")?.addEventListener("click", refreshStatus);
+  setupStageResizer();
 
   const rgbToggle = $("#depth-rgb-toggle");
   if (rgbToggle) {
@@ -797,42 +1195,81 @@ function setupInteractions() {
   document.querySelectorAll("[data-mission]").forEach((button) => {
     button.addEventListener("click", () => sendMissionSignal(button.dataset.mission));
   });
+  window.addEventListener("keydown", handleMissionHotkey);
 
-  const arm = $("#arm-button");
-  arm.addEventListener("mousedown", () => {
-    state.armed = true;
-    arm.classList.add("armed");
-    arm.textContent = "ARMED";
-    setText("#teleop-state", "ARMED");
+  $("#audio-upload-btn")?.addEventListener("click", uploadAudio);
+  $("#audio-stop-btn")?.addEventListener("click", stopAudio);
+  $("#audio-file")?.addEventListener("change", () => {
+    const files = [...($("#audio-file")?.files || [])];
+    const totalSize = files.reduce((total, file) => total + file.size, 0);
+    setText("#audio-state", files.length ? "SELECTED" : "READY");
+    setText("#audio-selected", files.length ? `${formatFileCount(files.length)} selected · ${formatBytes(totalSize)}` : "No file selected");
   });
-  ["mouseup", "mouseleave", "blur"].forEach((eventName) => {
-    arm.addEventListener(eventName, () => {
-      state.armed = false;
-      state.drive = { linear: 0, angular: 0 };
-      arm.classList.remove("armed");
-      arm.textContent = "Hold To Arm";
-      setText("#teleop-state", "LOCKED");
-      updateDriveMeters();
-    });
+}
+
+function setupStageResizer() {
+  const resizer = $("#stage-resizer");
+  const stage = $(".stage-body") || $(".main-stage");
+  if (!resizer || !stage) return;
+
+  const saved = Number(localStorage.getItem("fmsStageCameraRatio"));
+  if (Number.isFinite(saved) && saved >= 0.28 && saved <= 0.82) {
+    document.documentElement.style.setProperty("--stage-camera-ratio", String(saved));
+  }
+
+  let dragging = false;
+
+  const stageUsesVerticalSplit = () =>
+    window.matchMedia("(max-width: 1080px)").matches || stage.getBoundingClientRect().width < stage.getBoundingClientRect().height;
+
+  const applyStageRatio = (clientX, clientY) => {
+    const rect = stage.getBoundingClientRect();
+    const ratio = stageUsesVerticalSplit()
+      ? (clientY - rect.top) / Math.max(1, rect.height)
+      : (clientX - rect.left) / Math.max(1, rect.width);
+    const clamped = Math.min(0.82, Math.max(0.28, ratio));
+    document.documentElement.style.setProperty("--stage-camera-ratio", String(clamped));
+    resizeRenderer();
+  };
+
+  const stopDrag = () => {
+    if (!dragging) return;
+    dragging = false;
+    resizer.classList.remove("is-dragging");
+    const ratio = getComputedStyle(document.documentElement).getPropertyValue("--stage-camera-ratio").trim();
+    localStorage.setItem("fmsStageCameraRatio", ratio);
+    resizeRenderer();
+  };
+
+  resizer.addEventListener("pointerdown", (event) => {
+    if (document.body.classList.contains("scene-collapsed")) return;
+    dragging = true;
+    resizer.classList.add("is-dragging");
+    resizer.setPointerCapture(event.pointerId);
+    applyStageRatio(event.clientX, event.clientY);
   });
 
-  document.querySelectorAll("[data-drive]").forEach((button) => {
-    button.addEventListener("mousedown", () => {
-      if (!state.armed) return;
-      const drive = button.dataset.drive;
-      state.drive = {
-        forward: { linear: 0.35, angular: 0 },
-        back: { linear: -0.25, angular: 0 },
-        left: { linear: 0, angular: 0.45 },
-        right: { linear: 0, angular: -0.45 },
-        stop: { linear: 0, angular: 0 },
-      }[drive];
-      updateDriveMeters();
-    });
-    button.addEventListener("mouseup", () => {
-      state.drive = { linear: 0, angular: 0 };
-      updateDriveMeters();
-    });
+  resizer.addEventListener("pointermove", (event) => {
+    if (!dragging) return;
+    applyStageRatio(event.clientX, event.clientY);
+  });
+
+  resizer.addEventListener("pointerup", stopDrag);
+  resizer.addEventListener("pointercancel", stopDrag);
+
+  resizer.addEventListener("keydown", (event) => {
+    if (document.body.classList.contains("scene-collapsed")) return;
+    const current = Number(getComputedStyle(document.documentElement).getPropertyValue("--stage-camera-ratio"));
+    const step = event.shiftKey ? 0.08 : 0.04;
+    let next = current;
+    if (event.key === "ArrowLeft" || event.key === "ArrowUp") next -= step;
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") next += step;
+    if (next === current) return;
+    const clamped = Math.min(0.82, Math.max(0.28, next));
+    document.documentElement.style.setProperty("--stage-camera-ratio", String(clamped));
+    localStorage.setItem("fmsStageCameraRatio", String(clamped));
+    resizeRenderer();
+    event.preventDefault();
   });
 }
 
@@ -842,11 +1279,6 @@ function updateDepthRgbToggle() {
   button.classList.toggle("active", state.depthRgbOverlay);
   button.setAttribute("aria-pressed", state.depthRgbOverlay ? "true" : "false");
   button.textContent = state.depthRgbOverlay ? "RGB ON" : "RGB OFF";
-}
-
-function updateDriveMeters() {
-  setText("#linear-meter", state.drive.linear.toFixed(2));
-  setText("#angular-meter", state.drive.angular.toFixed(2));
 }
 
 function matIdentity() {
@@ -1060,13 +1492,26 @@ function initMeshViewer() {
 
   const depthGroup = new THREE.Group();
   depthGroup.matrixAutoUpdate = false;
-  const surfaceGeometry = new THREE.BufferGeometry();
-  const surfaceMaterial = new THREE.MeshStandardMaterial({
+  const surfaceFillGeometry = new THREE.BufferGeometry();
+  const surfaceFillMaterial = new THREE.PointsMaterial({
+    size: 0.032,
+    map: makeDepthPointTexture(),
     vertexColors: true,
     transparent: true,
-    opacity: 0.9,
-    roughness: 0.82,
-    metalness: 0.0,
+    opacity: 0.62,
+    alphaTest: 0.04,
+    depthTest: true,
+    depthWrite: false,
+  });
+  const depthSurfaceFill = new THREE.Points(surfaceFillGeometry, surfaceFillMaterial);
+  depthSurfaceFill.frustumCulled = false;
+  depthSurfaceFill.renderOrder = 1.8;
+  depthGroup.add(depthSurfaceFill);
+  const surfaceGeometry = new THREE.BufferGeometry();
+  const surfaceMaterial = new THREE.MeshBasicMaterial({
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.96,
     side: THREE.DoubleSide,
     depthTest: true,
     depthWrite: false,
@@ -1075,13 +1520,25 @@ function initMeshViewer() {
   depthSurface.frustumCulled = false;
   depthSurface.renderOrder = 2;
   depthGroup.add(depthSurface);
+  const surfaceWireGeometry = new THREE.BufferGeometry();
+  const surfaceWireMaterial = new THREE.LineBasicMaterial({
+    color: 0xd8fbff,
+    transparent: true,
+    opacity: 0.28,
+    depthTest: true,
+    depthWrite: false,
+  });
+  const depthSurfaceWire = new THREE.LineSegments(surfaceWireGeometry, surfaceWireMaterial);
+  depthSurfaceWire.frustumCulled = false;
+  depthSurfaceWire.renderOrder = 2.5;
+  depthGroup.add(depthSurfaceWire);
   const pointGeometry = new THREE.BufferGeometry();
   const pointMaterial = new THREE.PointsMaterial({
-    size: 0.014,
+    size: 0.012,
     map: makeDepthPointTexture(),
     vertexColors: true,
     transparent: true,
-    opacity: 0.96,
+    opacity: 0.45,
     alphaTest: 0.05,
     depthTest: true,
     depthWrite: false,
@@ -1106,13 +1563,30 @@ function initMeshViewer() {
   state.mesh.root = root;
   state.mesh.depthGroup = depthGroup;
   state.mesh.depthPoints = depthPoints;
+  state.mesh.depthSurfaceFill = depthSurfaceFill;
   state.mesh.depthSurface = depthSurface;
+  state.mesh.depthSurfaceWire = depthSurfaceWire;
   state.mesh.depthFrustum = depthFrustum;
   state.mesh.depthObjectMarkers = depthObjectMarkers;
   updateOrbitCamera();
   bindSceneControls(canvas);
   resizeRenderer();
   window.addEventListener("resize", resizeRenderer);
+}
+
+function initMeshViewerSafe() {
+  try {
+    initMeshViewer();
+    return true;
+  } catch (error) {
+    console.error(error);
+    setText("#scene-root", "3D unavailable");
+    setText("#scene-source", "camera streams active");
+    setText("#scene-joints", "0 joints");
+    setText("#scene-links", "0 links");
+    setText("#scene-meshes", "0 meshes");
+    return false;
+  }
 }
 
 function makeDepthPointTexture() {
@@ -1339,11 +1813,30 @@ async function objectForMeshUrl(url, linkName) {
   return cloneWithRuntimeMaterial(asset, linkName);
 }
 
+const DEPTH_COLOR_STOPS = [
+  [0.0, 0.19, 0.07, 0.23],
+  [0.12, 0.25, 0.24, 0.63],
+  [0.25, 0.28, 0.45, 0.85],
+  [0.38, 0.14, 0.66, 0.82],
+  [0.5, 0.48, 0.82, 0.32],
+  [0.62, 0.92, 0.74, 0.07],
+  [0.75, 1.0, 0.49, 0.02],
+  [0.88, 0.79, 0.15, 0.01],
+  [1.0, 0.48, 0.02, 0.01],
+];
+
 function depthColor(depth, near, far) {
   const t = Math.max(0, Math.min(1, (depth - near) / Math.max(0.001, far - near)));
-  if (t < 0.35) return [1.0, 0.36 + t, 0.2];
-  if (t < 0.72) return [0.25, 0.92, 0.72 + (t - 0.35) * 0.55];
-  return [0.35, 0.7 - (t - 0.72) * 0.55, 1.0];
+  const stopIndex = DEPTH_COLOR_STOPS.findIndex((stop) => t <= stop[0]);
+  const high = DEPTH_COLOR_STOPS[Math.max(1, stopIndex < 0 ? DEPTH_COLOR_STOPS.length - 1 : stopIndex)];
+  const low = DEPTH_COLOR_STOPS[DEPTH_COLOR_STOPS.indexOf(high) - 1];
+  const local = (t - low[0]) / Math.max(0.001, high[0] - low[0]);
+  const contour = 0.9 + 0.1 * Math.sin(t * Math.PI * 42);
+  return [
+    clamp((low[1] + (high[1] - low[1]) * local) * contour, 0, 1),
+    clamp((low[2] + (high[2] - low[2]) * local) * contour, 0, 1),
+    clamp((low[3] + (high[3] - low[3]) * local) * contour, 0, 1),
+  ];
 }
 
 function objectColor(id, objects) {
@@ -1365,12 +1858,12 @@ function colorForDepthPoint(point, near, far, objects) {
   const px = Number(point?.[0] || 0);
   const py = Number(point?.[1] || 0);
   const pz = Number(point?.[2] || 0);
-  return depthColor(Math.hypot(px, py, pz), near, far);
+  return depthColor(Number.isFinite(pz) ? pz : Math.hypot(px, py, pz), near, far);
 }
 
 function updateDepthGeometry() {
-  const { depthPoints, depthSurface, depthFrustum, depthObjectMarkers } = state.mesh;
-  if (!depthPoints || !depthSurface || !depthFrustum || !depthObjectMarkers) return;
+  const { depthPoints, depthSurfaceFill, depthSurface, depthSurfaceWire, depthFrustum, depthObjectMarkers } = state.mesh;
+  if (!depthPoints || !depthSurfaceFill || !depthSurface || !depthSurfaceWire || !depthFrustum || !depthObjectMarkers) return;
   const depth = state.depthState || {};
   const config = state.config?.robots?.[state.robotId]?.depthSensor || depth.config || {};
   const objects = Array.isArray(depth.objects) ? depth.objects : [];
@@ -1407,6 +1900,8 @@ function updateDepthGeometry() {
   const vertexIndex = new Int32Array(surfacePoints.length).fill(-1);
   const surfacePositions = [];
   const surfaceColors = [];
+  const surfaceFillPositions = [];
+  const surfaceFillColors = [];
   surfacePoints.forEach((point, index) => {
     if (!Array.isArray(point)) return;
     const px = Number(point[0]);
@@ -1417,8 +1912,11 @@ function updateDepthGeometry() {
     surfacePositions.push(px, py, pz);
     const color = colorForDepthPoint(point, near, far, objects);
     surfaceColors.push(color[0], color[1], color[2]);
+    surfaceFillPositions.push(px, py, pz);
+    surfaceFillColors.push(color[0], color[1], color[2]);
   });
   const indices = [];
+  const surfaceLinePositions = [];
   const addTriangle = (a, b, c) => {
     const ia = vertexIndex[a];
     const ib = vertexIndex[b];
@@ -1430,6 +1928,15 @@ function updateDepthGeometry() {
     if (Math.max(za, zb, zc) - Math.min(za, zb, zc) > maxDepthDelta) return;
     indices.push(ia, ib, ic);
   };
+  const addSurfaceLine = (a, b) => {
+    const ia = vertexIndex[a];
+    const ib = vertexIndex[b];
+    if (ia < 0 || ib < 0) return;
+    const pa = surfacePoints[a];
+    const pb = surfacePoints[b];
+    if (Math.abs(pa[2] - pb[2]) > maxDepthDelta) return;
+    surfaceLinePositions.push(pa[0], pa[1], pa[2], pb[0], pb[1], pb[2]);
+  };
   if (surfaceWidth > 1 && surfaceHeight > 1) {
     for (let row = 0; row < surfaceHeight - 1; row += 1) {
       for (let col = 0; col < surfaceWidth - 1; col += 1) {
@@ -1439,6 +1946,8 @@ function updateDepthGeometry() {
         const d = c + 1;
         addTriangle(a, c, b);
         addTriangle(b, c, d);
+        addSurfaceLine(a, b);
+        addSurfaceLine(a, c);
       }
     }
   }
@@ -1447,6 +1956,12 @@ function updateDepthGeometry() {
   depthSurface.geometry.setAttribute("color", new THREE.Float32BufferAttribute(surfaceColors, 3));
   depthSurface.geometry.computeVertexNormals();
   depthSurface.geometry.computeBoundingSphere();
+  depthSurfaceFill.geometry.setIndex(null);
+  depthSurfaceFill.geometry.setAttribute("position", new THREE.Float32BufferAttribute(surfaceFillPositions, 3));
+  depthSurfaceFill.geometry.setAttribute("color", new THREE.Float32BufferAttribute(surfaceFillColors, 3));
+  depthSurfaceFill.geometry.computeBoundingSphere();
+  depthSurfaceWire.geometry.setAttribute("position", new THREE.Float32BufferAttribute(surfaceLinePositions, 3));
+  depthSurfaceWire.geometry.computeBoundingSphere();
   if (
     surfacePositions.length &&
     state.urdf &&
