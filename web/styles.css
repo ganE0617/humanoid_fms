@@ -361,8 +361,23 @@ select {
 .mission-shell-panel {
   min-height: 0;
   display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
   align-items: stretch;
   overflow: hidden;
+}
+
+.mission-panel-b .mission-state {
+  justify-content: flex-end;
+}
+
+.mission-panel-b[data-notice="1"] {
+  border-color: rgba(94, 228, 147, 0.82);
+  background: rgba(12, 42, 25, 0.74);
+}
+
+.mission-panel-b[data-notice="1"] .mission-state b {
+  color: var(--green);
 }
 
 .camera-panel {
@@ -1019,6 +1034,12 @@ body.scene-collapsed .camera-panel {
 
 .mission-ok-label {
   color: var(--green);
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.mission-fail-label {
+  color: #ff5b5b;
   font-size: 11px;
   font-weight: 900;
 }

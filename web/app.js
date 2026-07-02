@@ -366,12 +366,30 @@ async function refreshMissionState() {
     state.missionState = {
       stage: "offline",
       events: [],
-      machineState: {
-        service: "/machine_state",
-        state: 0,
-        available: false,
-        updated: 0,
-        error: "mission API offline",
+      sections: {
+        a: {
+          label: "A구간",
+          machineState: {
+            service: "/machine_state_a",
+            state: 0,
+            available: false,
+            updated: 0,
+            error: "mission API offline",
+          },
+        },
+        c: {
+          label: "C구간",
+          machineState: {
+            service: "/machine_state_c",
+            state: 0,
+            available: false,
+            updated: 0,
+            error: "mission API offline",
+          },
+        },
+        b: {
+          label: "B구간",
+        },
       },
     };
     renderMissionPanel();
@@ -379,47 +397,74 @@ async function refreshMissionState() {
 }
 
 async function sendMissionSignal(signal) {
-  setText("#mission-last", `${signal.toUpperCase()} sending`);
+  setText("#mission-last-b", `${signal.toUpperCase()} sending`);
   try {
     state.missionState = await postJson("/api/mission-signal", { signal });
     renderMissionPanel();
   } catch (error) {
-    setText("#mission-last", `${signal.toUpperCase()} failed`);
+    setText("#mission-last-b", `${signal.toUpperCase()} failed`);
     console.error(error);
   }
 }
 
 function renderMissionPanel() {
-  const mission = state.missionState || { stage: "idle", events: [] };
-  const machine = mission.machineState || {};
-  const machineState = Number(machine.state ?? 0);
-  const isOk = machineState === 1;
-  const stageEl = $("#mission-stage");
-  const okSign = $("#mission-ok");
-  setText("#mission-stage", "MISSION OK");
-  if (stageEl) stageEl.hidden = !isOk;
-  if (okSign) okSign.hidden = isOk;
-  setText("#mission-topic", machine.service || "/machine_state");
-  const rosTimes = [Number(machine.updated || 0)].filter((value) => value > 0);
-  const latestRos = rosTimes.length ? Math.max(...rosTimes) : 0;
-  const serviceError = String(machine.error || "");
-  const notice = state.missionNotice && state.missionNotice.until > Date.now() ? state.missionNotice : null;
-  const label = notice
-    ? notice.text
-    : latestRos
-      ? `ROS ${new Date(latestRos * 1000).toLocaleTimeString("en-GB", { hour12: false })}`
-      : serviceError || "waiting for ROS";
-  setText("#mission-last", label);
-  const panel = $(".mission-panel");
+  const mission = state.missionState || { stage: "idle", events: [], sections: {} };
+  renderMissionSection("a", mission.sections?.a || { label: "A구간" });
+  renderMissionSectionB(mission.sections?.b || { label: "B구간" });
+  renderMissionSection("c", mission.sections?.c || { label: "C구간" });
+}
+
+function renderMissionSectionB(section) {
+  const label = section.label || "B구간";
+  const notice = state.missionNotice?.section === "b" && state.missionNotice.until > Date.now()
+    ? state.missionNotice
+    : null;
+  setText("#mission-label-b", label);
+  setText("#mission-last-b", notice ? notice.text : "F9 Start / F10 Finish");
+  const panel = $("#mission-panel-b");
   if (panel) {
-    panel.dataset.stage = isOk ? "ok" : "idle";
-    panel.dataset.machineState = isOk ? "1" : "0";
+    panel.dataset.stage = notice ? "started" : "idle";
+    panel.dataset.machineState = "0";
     panel.dataset.notice = notice ? "1" : "0";
   }
 }
 
+function renderMissionSection(sectionId, section) {
+  const machine = section.machineState || {};
+  const machineState = Number(machine.state ?? 0);
+  const hasFreshUpdate = Number(machine.updated || 0) > 0;
+  const hasClient = Number(machine.clients ?? 0) > 0;
+  const summary = String(machine.summary || "").trim();
+  const isOk = machineState === 1 && hasClient && machine.available !== false && hasFreshUpdate;
+  const okText = summary ? `MISSION OK : ${summary}` : "MISSION OK";
+  const stageEl = $(`#mission-stage-${sectionId}`);
+  const defaultLabel = sectionId === "a" ? "A구간" : "C구간";
+  const defaultService = sectionId === "a" ? "/machine_state_a" : "/machine_state_c";
+  setText(`#mission-label-${sectionId}`, section.label || defaultLabel);
+  if (stageEl) {
+    stageEl.hidden = false;
+    stageEl.classList.toggle("mission-ok-label", isOk);
+    stageEl.classList.toggle("mission-fail-label", !isOk);
+    setText(`#mission-stage-${sectionId}`, isOk ? okText : "인지 안됨");
+  }
+  setText(`#mission-topic-${sectionId}`, machine.service || defaultService);
+  const serviceError = String(machine.error || "");
+  const detail = isOk
+    ? `ROS ${new Date(Number(machine.updated) * 1000).toLocaleTimeString("en-GB", { hour12: false })}`
+    : serviceError && serviceError !== "waiting for OCR"
+      ? serviceError
+      : "";
+  setText(`#mission-last-${sectionId}`, detail);
+  const panel = $(`#mission-panel-${sectionId}`);
+  if (panel) {
+    panel.dataset.stage = isOk ? "ok" : "idle";
+    panel.dataset.machineState = isOk ? "1" : "0";
+    panel.dataset.notice = "0";
+  }
+}
+
 function showMissionNotice(text) {
-  state.missionNotice = { text, until: Date.now() + 3000 };
+  state.missionNotice = { text, until: Date.now() + 3000, section: "b" };
   if (state.missionNoticeTimer) clearTimeout(state.missionNoticeTimer);
   renderMissionPanel();
   state.missionNoticeTimer = setTimeout(() => {

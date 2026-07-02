@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import socket
@@ -8,13 +9,15 @@ import threading
 import time
 import http.client
 import importlib
+import re
+import shlex
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 import cv2
 import numpy as np
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -24,8 +27,21 @@ CONFIG_DIR = ROOT / "config"
 WEB_DIR = ROOT / "web"
 VENDOR_DIR = ROOT / "vendor"
 DOCKER_SOCKET = Path("/var/run/docker.sock")
+AUDIO_DIR = ROOT / "logs" / "audio"
+AUDIO_LOG = ROOT / "logs" / "audio_playback.log"
 
 app = FastAPI(title="Humanoid FMS", version="0.1.0")
+
+
+@app.middleware("http")
+async def no_cache_web_assets(request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path == "/" or path.endswith((".html", ".js", ".css")):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
 _STATUS_CACHE: dict[str, Any] = {"time": 0.0, "data": None}
 _ROS_MONITOR: "RosMonitor | None" = None
 _CAMERA_WORKERS: dict[str, "CameraStreamWorker"] = {}
@@ -34,7 +50,11 @@ _SYNC_CONDITION = threading.Condition()
 _SYNC_THREAD: threading.Thread | None = None
 _SYNC_SEQ = 0
 _SYNC_TIME = 0.0
+_AUDIO_LOCK = threading.Lock()
+_AUDIO_PROC: subprocess.Popen[bytes] | None = None
+_AUDIO_CURRENT = ""
 VENDOR_DIR.mkdir(exist_ok=True)
+AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_json(path: Path) -> Any:
@@ -47,7 +67,208 @@ def run(cmd: list[str], timeout: float = 3.0) -> subprocess.CompletedProcess[str
 
 
 def sh(command: str, timeout: float = 3.0) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, shell=True, text=True, capture_output=True, timeout=timeout, check=False)
+    try:
+        return subprocess.run(command, shell=True, text=True, capture_output=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "timeout")
+        return subprocess.CompletedProcess(command, 124, stdout, stderr)
+
+
+def safe_audio_name(filename: str) -> str:
+    name = Path(filename or "").name.strip()
+    stem = Path(name).stem
+    suffix = Path(name).suffix.lower()
+    if suffix != ".mp3":
+        raise HTTPException(status_code=400, detail="only .mp3 files are supported")
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
+    if not stem:
+        stem = f"audio_{int(time.time())}"
+    return f"{stem}.mp3"
+
+
+def audio_device() -> str:
+    if audio_backend() == "pulse":
+        return os.getenv("FMS_PULSE_SINK") or os.getenv("FMS_AUDIO_DEVICE", "alsa_output.platform-sound.analog-stereo")
+    return os.getenv("FMS_AUDIO_DEVICE", "plughw:1,0")
+
+
+def audio_backend() -> str:
+    return os.getenv("FMS_AUDIO_BACKEND", "pulse").strip().lower() or "pulse"
+
+
+def pulse_server() -> str:
+    return os.getenv("FMS_PULSE_SERVER") or os.getenv("PULSE_SERVER", "unix:/run/user/1000/pulse/native")
+
+
+def audio_tail_pad_seconds() -> float:
+    try:
+        return max(0.0, min(3.0, float(os.getenv("FMS_AUDIO_TAIL_PAD_SEC", "1.50"))))
+    except ValueError:
+        return 1.50
+
+
+def audio_latency_msec() -> int:
+    try:
+        return max(40, min(500, int(float(os.getenv("FMS_AUDIO_LATENCY_MSEC", "120")))))
+    except ValueError:
+        return 120
+
+
+def audio_volume_percent() -> int:
+    try:
+        return max(0, min(150, int(float(os.getenv("FMS_AUDIO_VOLUME_PERCENT", "95")))))
+    except ValueError:
+        return 95
+
+
+def audio_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["PULSE_SERVER"] = pulse_server()
+    return env
+
+
+def audio_files() -> list[dict[str, Any]]:
+    files = []
+    for path in sorted(AUDIO_DIR.glob("*.mp3"), key=lambda item: item.stat().st_mtime, reverse=True):
+        stat = path.stat()
+        files.append(
+            {
+                "name": path.name,
+                "size": stat.st_size,
+                "modified": stat.st_mtime,
+            }
+        )
+    return files
+
+
+def audio_devices() -> dict[str, Any]:
+    aplay = sh("aplay -l 2>/dev/null || true", timeout=3)
+    pactl = subprocess.run(
+        ["bash", "-lc", "pactl list short sinks 2>/dev/null || true"],
+        text=True,
+        capture_output=True,
+        timeout=3,
+        check=False,
+        env=audio_env(),
+    )
+    devices = []
+    pattern = re.compile(r"card (?P<card>\d+): (?P<card_name>[^[]+) \[(?P<card_label>[^\]]+)\], device (?P<device>\d+): (?P<device_name>[^[]+) \[(?P<device_label>[^\]]*)\]")
+    for line in aplay.stdout.splitlines():
+        match = pattern.search(line)
+        if not match:
+            continue
+        card = match.group("card")
+        device = match.group("device")
+        devices.append(
+            {
+                "alsa": f"plughw:{card},{device}",
+                "card": int(card),
+                "device": int(device),
+                "label": f"{match.group('card_label')} / {match.group('device_name').strip()}",
+            }
+        )
+    return {
+        "backend": audio_backend(),
+        "defaultDevice": audio_device(),
+        "pulseServer": pulse_server(),
+        "volumePercent": audio_volume_percent(),
+        "alsa": devices,
+        "sinks": [line.split("\t") for line in pactl.stdout.splitlines() if line.strip()],
+    }
+
+
+def stop_audio_playback() -> None:
+    global _AUDIO_PROC, _AUDIO_CURRENT
+    with _AUDIO_LOCK:
+        proc = _AUDIO_PROC
+        _AUDIO_PROC = None
+        _AUDIO_CURRENT = ""
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=1.5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def audio_playback_state() -> dict[str, Any]:
+    with _AUDIO_LOCK:
+        running = bool(_AUDIO_PROC and _AUDIO_PROC.poll() is None)
+        current = _AUDIO_CURRENT if running else ""
+    return {"playing": running, "current": current}
+
+
+def audio_log_tail(max_chars: int = 1200) -> str:
+    if not AUDIO_LOG.exists():
+        return ""
+    data = AUDIO_LOG.read_text(encoding="utf-8", errors="replace")
+    return data[-max_chars:].strip()
+
+
+def audio_duration_seconds(path: Path) -> float:
+    proc = run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        timeout=3,
+    )
+    try:
+        return max(0.0, float(proc.stdout.strip()))
+    except ValueError:
+        return 0.0
+
+
+def audio_command(path: Path, device: str) -> list[str]:
+    volume = audio_volume_percent() / 100.0
+    if audio_backend() == "pulse":
+        pad = audio_tail_pad_seconds()
+        command = [
+            "ffmpeg",
+            "-nostdin",
+            "-re",
+            "-v",
+            "warning",
+            "-i",
+            str(path),
+        ]
+        if pad > 0:
+            command += [
+                "-re",
+                "-f",
+                "lavfi",
+                "-t",
+                f"{pad:.2f}",
+                "-i",
+                "anullsrc=r=44100:cl=stereo",
+                "-filter_complex",
+                f"[0:a][1:a]concat=n=2:v=0:a=1,volume={volume:.2f}",
+            ]
+        if pad <= 0:
+            command += ["-filter:a", f"volume={volume:.2f}"]
+        command += [
+            "-vn",
+            "-f",
+            "pulse",
+            "-server",
+            pulse_server(),
+            "-device",
+            device,
+            f"Humanoid FMS - {path.name}",
+        ]
+        return command
+    return [
+        "bash",
+        "-lc",
+        f"ffmpeg -nostdin -v warning -i {shlex.quote(str(path))} -filter:a volume={audio_volume_percent() / 100.0:.2f} -f wav - | aplay -q -D {shlex.quote(device)}",
+    ]
 
 
 def sync_fps() -> int:
@@ -97,6 +318,13 @@ def robot_configs() -> dict[str, dict[str, Any]]:
     for path in sorted((CONFIG_DIR / "robots").glob("*.json")):
         data = load_json(path)
         robots[data["id"]] = data
+    if os.getenv("FMS_UNITREE_COMPAT_ALIAS", "1") != "0" and "ai_worker" in robots and "unitree" not in robots:
+        compat = json.loads(json.dumps(robots["ai_worker"]))
+        compat["id"] = "unitree"
+        compat["label"] = robots["ai_worker"].get("label", "ROBOTIS AI Worker")
+        compat["model"] = robots["ai_worker"].get("model", compat["label"])
+        compat["description"] = "Compatibility alias for cached FMS clients; uses the AI Worker humanoid configuration."
+        robots["unitree"] = compat
     return robots
 
 
@@ -123,6 +351,176 @@ def capture_source(path: str) -> str | int:
     if name.startswith("video") and name[5:].isdigit():
         return int(name[5:])
     return resolved
+
+
+def is_ros_camera(cam: dict[str, Any]) -> bool:
+    return str(cam.get("source", "")).lower() == "ros"
+
+
+def web_video_server_config() -> dict[str, Any]:
+    return {
+        "enabled": os.getenv("FMS_WEB_VIDEO_ENABLED", "1").lower() not in {"0", "false", "no"},
+        "port": int(os.getenv("FMS_WEB_VIDEO_PORT", "8080")),
+        "quality": int(os.getenv("FMS_WEB_VIDEO_QUALITY", "80")),
+        "streamType": os.getenv("FMS_WEB_VIDEO_STREAM_TYPE", "mjpeg"),
+    }
+
+
+def web_video_topic(cam: dict[str, Any], ros_status: dict[str, Any] | None = None) -> str:
+    return str(
+        cam.get("webVideoTopic")
+        or (ros_status or {}).get("topic")
+        or cam.get("device")
+        or ""
+    )
+
+
+def web_video_request_topic(cam: dict[str, Any]) -> str:
+    topic = str(cam.get("webVideoRequestTopic") or web_video_topic(cam))
+    stream_type = str(cam.get("webVideoStreamType", web_video_server_config().get("streamType", "mjpeg")))
+    if topic.endswith("/compressed"):
+        return topic[: -len("/compressed")]
+    return topic
+
+
+def camera_uses_web_video(cam: dict[str, Any]) -> bool:
+    return (
+        web_video_server_config().get("enabled", True)
+        and cam.get("webVideoEnabled", True) is not False
+        and bool(cam.get("webVideoTopic"))
+    )
+
+
+def direct_video_enabled() -> bool:
+    return False
+
+
+def ros_time_to_float(stamp: Any) -> float:
+    sec = float(getattr(stamp, "sec", 0) or 0)
+    nanosec = float(getattr(stamp, "nanosec", 0) or 0)
+    value = sec + nanosec / 1_000_000_000.0
+    return value if value > 0 else time.time()
+
+
+def jpeg_dimensions(data: bytes) -> tuple[int, int]:
+    if len(data) < 4 or data[0:2] != b"\xff\xd8":
+        return 0, 0
+    sof_markers = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+    i = 2
+    while i + 8 < len(data):
+        while i < len(data) and data[i] == 0xFF:
+            i += 1
+        if i >= len(data):
+            break
+        marker = data[i]
+        i += 1
+        if marker in {0xD8, 0xD9, 0x01} or 0xD0 <= marker <= 0xD7:
+            continue
+        if i + 2 > len(data):
+            break
+        length = (data[i] << 8) | data[i + 1]
+        if length < 2 or i + length > len(data):
+            break
+        if marker in sof_markers and length >= 7:
+            height = (data[i + 3] << 8) | data[i + 4]
+            width = (data[i + 5] << 8) | data[i + 6]
+            return int(width), int(height)
+        i += length
+    return 0, 0
+
+
+def decode_ros_image(msg: Any) -> np.ndarray:
+    width = int(msg.width)
+    height = int(msg.height)
+    encoding = str(msg.encoding or "").lower()
+    data = np.frombuffer(msg.data, dtype=np.uint8)
+    step = int(msg.step or 0)
+    if width <= 0 or height <= 0:
+        raise ValueError("empty ROS image")
+
+    if encoding in {"bgr8", "rgb8"}:
+        channels = 3
+        row_bytes = step or width * channels
+        image = data[: row_bytes * height].reshape((height, row_bytes))[:, : width * channels]
+        image = image.reshape((height, width, channels))
+        return cv2.cvtColor(image, cv2.COLOR_RGB2BGR) if encoding == "rgb8" else image.copy()
+    if encoding in {"bgra8", "rgba8"}:
+        channels = 4
+        row_bytes = step or width * channels
+        image = data[: row_bytes * height].reshape((height, row_bytes))[:, : width * channels]
+        image = image.reshape((height, width, channels))
+        return cv2.cvtColor(image, cv2.COLOR_RGBA2BGR if encoding == "rgba8" else cv2.COLOR_BGRA2BGR)
+    if encoding in {"mono8", "8uc1"}:
+        row_bytes = step or width
+        image = data[: row_bytes * height].reshape((height, row_bytes))[:, :width]
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    if encoding in {"mono16", "16uc1"}:
+        row_bytes = step or width * 2
+        raw = data[: row_bytes * height].reshape((height, row_bytes))[:, : width * 2]
+        image16 = raw.reshape((height, width, 2)).view(np.uint16).reshape((height, width))
+        image8 = cv2.convertScaleAbs(image16, alpha=255.0 / max(1, int(image16.max() or 1)))
+        return cv2.cvtColor(image8, cv2.COLOR_GRAY2BGR)
+    if encoding in {"yuyv", "yuyv422", "yuv422", "uyvy"}:
+        row_bytes = step or width * 2
+        image = data[: row_bytes * height].reshape((height, row_bytes))[:, : width * 2]
+        image = image.reshape((height, width, 2))
+        code = cv2.COLOR_YUV2BGR_UYVY if encoding == "uyvy" else cv2.COLOR_YUV2BGR_YUYV
+        return cv2.cvtColor(image, code)
+
+    channels = max(1, len(data) // max(1, width * height))
+    if channels >= 3:
+        image = data[: width * height * channels].reshape((height, width, channels))[:, :, :3]
+        return image.copy()
+    raise ValueError(f"unsupported ROS image encoding: {msg.encoding}")
+
+
+def decode_ros_depth_image(msg: Any, scale_meters: float) -> np.ndarray:
+    width = int(msg.width)
+    height = int(msg.height)
+    encoding = str(msg.encoding or "").lower()
+    data = np.frombuffer(msg.data, dtype=np.uint8)
+    step = int(msg.step or 0)
+    if width <= 0 or height <= 0:
+        raise ValueError("empty ROS depth image")
+
+    if encoding in {"16uc1", "mono16"}:
+        row_bytes = step or width * 2
+        raw = data[: row_bytes * height].reshape((height, row_bytes))[:, : width * 2]
+        return raw.reshape((height, width, 2)).view(np.uint16).reshape((height, width)).copy()
+
+    if encoding in {"32fc1"}:
+        row_bytes = step or width * 4
+        raw = data[: row_bytes * height].reshape((height, row_bytes))[:, : width * 4]
+        depth_m = raw.reshape((height, width, 4)).view(np.float32).reshape((height, width))
+        depth_units = np.nan_to_num(depth_m / max(scale_meters, 1e-9), nan=0.0, posinf=0.0, neginf=0.0)
+        return np.clip(depth_units, 0, 65535).astype(np.uint16)
+
+    raise ValueError(f"unsupported ROS depth encoding: {msg.encoding}")
+
+
+def decode_ros_compressed_depth_image(msg: Any, scale_meters: float) -> np.ndarray:
+    data = bytes(getattr(msg, "data", b""))
+    if not data:
+        raise ValueError("empty compressed depth image")
+    fmt = str(getattr(msg, "format", "") or "").lower()
+    if "rvl" in fmt:
+        raise ValueError(f"unsupported compressed depth format: {msg.format}")
+    png_offset = data.find(b"\x89PNG\r\n\x1a\n")
+    if png_offset < 0:
+        png_offset = 0
+    decoded = cv2.imdecode(np.frombuffer(data[png_offset:], dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    if decoded is None:
+        raise ValueError("compressed depth decode failed")
+    if decoded.ndim == 3:
+        decoded = decoded[:, :, 0]
+    if decoded.dtype == np.uint16:
+        return decoded.copy()
+    if decoded.dtype == np.float32:
+        depth_units = np.nan_to_num(decoded / max(scale_meters, 1e-9), nan=0.0, posinf=0.0, neginf=0.0)
+        return np.clip(depth_units, 0, 65535).astype(np.uint16)
+    if np.issubdtype(decoded.dtype, np.integer):
+        return np.clip(decoded, 0, 65535).astype(np.uint16)
+    raise ValueError(f"unsupported compressed depth dtype: {decoded.dtype}")
 
 
 class V4L2CtlCapture:
@@ -945,6 +1343,138 @@ def depth_assist_overlay_from_z16(frame: np.ndarray, config: dict[str, Any]) -> 
     }
 
 
+def normalize_mission_name(value: str) -> str:
+    return "".join(ch for ch in str(value or "").upper() if ch.isalnum())
+
+
+def format_machine_state_summary(parts: list[str], counts: list[int] | None = None) -> str:
+    items: list[str] = []
+    for index, part in enumerate(parts):
+        name = str(part or "").strip()
+        if not name:
+            continue
+        if counts is not None:
+            count = int(counts[index]) if index < len(counts) else 1
+            items.append(f"{name} x{count}" if count != 1 else name)
+        else:
+            items.append(name)
+    return ", ".join(items)
+
+
+def ros_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("ROS_DOMAIN_ID", "30")
+    env.setdefault("RMW_IMPLEMENTATION", "rmw_zenoh_cpp")
+    return env
+
+
+def count_ros_service_clients(service_name: str) -> int | None:
+    service = str(service_name or "").strip()
+    if not service:
+        return None
+    command = (
+        "source /opt/ros/jazzy/setup.bash >/dev/null 2>&1; "
+        "if [ -f /opt/fms_humanoid_msgs/local_setup.bash ]; then "
+        "source /opt/fms_humanoid_msgs/local_setup.bash >/dev/null 2>&1; "
+        "elif [ -f /opt/fms_humanoid_msgs/setup.bash ]; then "
+        "source /opt/fms_humanoid_msgs/setup.bash >/dev/null 2>&1; "
+        "fi; "
+        f"ros2 service info {shlex.quote(service)} 2>/dev/null"
+    )
+    env = ros_subprocess_env()
+    for _ in range(2):
+        try:
+            proc = subprocess.run(
+                ["bash", "-lc", command],
+                text=True,
+                capture_output=True,
+                timeout=1.5,
+                check=False,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            continue
+        if proc.returncode != 0:
+            continue
+        for line in proc.stdout.splitlines():
+            cleaned = line.strip().lstrip("\\")
+            if cleaned.startswith("Clients count:"):
+                try:
+                    return int(cleaned.split(":", 1)[1].strip())
+                except ValueError:
+                    return None
+    return None
+
+
+def empty_machine_section(service: str) -> dict[str, Any]:
+    return {
+        "service": service,
+        "state": 0,
+        "parts": [],
+        "counts": [],
+        "summary": "",
+        "available": False,
+        "updated": 0.0,
+        "error": "not started",
+        "clients": 0,
+    }
+
+
+def effective_machine_section(data: dict[str, Any], stale_sec: float) -> dict[str, Any]:
+    now = time.time()
+    state = int(data.get("state", 0) or 0)
+    updated = float(data.get("updated", 0.0) or 0.0)
+    available = bool(data.get("available", False))
+    error = str(data.get("error") or "")
+    summary = str(data.get("summary") or "")
+    if stale_sec > 0 and updated > 0 and now - updated > stale_sec:
+        return {
+            **data,
+            "state": 0,
+            "summary": "",
+            "updated": 0.0,
+            "available": False,
+            "error": "state expired",
+        }
+    return {
+        **data,
+        "state": state,
+        "summary": summary,
+        "updated": updated,
+        "available": available,
+        "error": error,
+    }
+
+
+def mission_robot_config(robot_id: str) -> dict[str, Any]:
+    robot = robot_configs().get(robot_id, {})
+    mission = dict(robot.get("mission", {}) or {})
+    defaults = {
+        "machineStateAService": "/machine_state_a",
+        "machineStateCService": "/machine_state_c",
+        "taskAService": "/task",
+        "taskCService": "/task_c",
+        "graspPosesTopic": "/grasp_poses",
+        "taskStatusTopic": "/task/status",
+        "detectionConfidenceMin": 0.25,
+    }
+    for key, value in defaults.items():
+        mission.setdefault(key, value)
+    a_section = dict(mission.get("aSection", {}) or {})
+    a_section.setdefault("label", "A구간")
+    a_section.setdefault("parts", [])
+    a_section.setdefault("counts", [])
+    mission["aSection"] = a_section
+    c_section = dict(mission.get("cSection", {}) or {})
+    c_section.setdefault("label", "C구간")
+    c_section.setdefault("parts", [])
+    mission["cSection"] = c_section
+    b_section = dict(mission.get("bSection", {}) or {})
+    b_section.setdefault("label", "B구간")
+    mission["bSection"] = b_section
+    return mission
+
+
 class RosMonitor:
     def __init__(self, robot_id: str):
         self.robot_id = robot_id
@@ -953,9 +1483,12 @@ class RosMonitor:
         self.error = ""
         self.last_joint_time = 0.0
         self.last_tf_time = 0.0
+        self.last_battery_time = 0.0
         self.last_depth_time = 0.0
         self.joints: dict[str, float] = {}
         self.transforms: list[dict[str, Any]] = []
+        self.battery: dict[str, Any] = {}
+        self.batteries: dict[str, dict[str, Any]] = {}
         self.depth_frame = ""
         self.depth_points: list[list[float]] = []
         self.depth_surface: dict[str, Any] = {}
@@ -972,26 +1505,40 @@ class RosMonitor:
         self.depth_total = 0
         self.depth_nearest = 0.0
         self.depth_source = ""
+        self.depth_assist_time = 0.0
+        self.depth_assist_stats: dict[str, Any] = {}
+        self.camera_condition = threading.Condition()
+        self.camera_frames: dict[str, dict[str, Any]] = {}
         self.mission_seq = 0
         self.mission_stage = "idle"
         self.mission_queue: list[dict[str, Any]] = []
         self.mission_events: list[dict[str, Any]] = []
-        self.machine_state_service = "/machine_state"
-        self.machine_state: dict[str, Any] = {
-            "service": self.machine_state_service,
-            "state": 0,
-            "available": False,
-            "updated": 0.0,
-            "error": "not started",
-        }
+        mission_cfg = mission_robot_config(robot_id)
+        self.machine_state_a = empty_machine_section(str(mission_cfg.get("machineStateAService", "/machine_state_a")))
+        self.machine_state_c = empty_machine_section(str(mission_cfg.get("machineStateCService", "/machine_state_c")))
+        self.a_parts: list[str] = []
+        self.a_counts: list[int] = []
+        self.a_accepted = False
+        self.a_parts_time = 0.0
+        self.c_parts: list[str] = []
+        self.c_accepted = False
+        self.c_parts_time = 0.0
+        self.grasp_classes: dict[str, int] = {}
+        self.grasp_poses_time = 0.0
         self.thread = threading.Thread(target=self._run, name="fms-ros-monitor", daemon=True)
         self.depth_thread = threading.Thread(target=self._run_depth_fallback, name="fms-depth-stream", daemon=True)
         self.depth_geometry_thread = threading.Thread(target=self._run_depth_geometry, name="fms-depth-geometry", daemon=True)
+        self.machine_state_poll_thread = threading.Thread(
+            target=self._poll_machine_state_clients_loop,
+            name="fms-machine-state-poll",
+            daemon=True,
+        )
 
     def start(self) -> None:
         self.thread.start()
         self.depth_thread.start()
         self.depth_geometry_thread.start()
+        self.machine_state_poll_thread.start()
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -1004,6 +1551,22 @@ class RosMonitor:
                 "lastTfTime": self.last_tf_time,
                 "joints": self.joints,
                 "transforms": self.transforms[-200:],
+            }
+
+    def battery_snapshot(self) -> dict[str, Any]:
+        robot = robot_configs().get(self.robot_id, {})
+        topics = robot.get("topics", {})
+        with self.lock:
+            data = dict(self.battery)
+            batteries = [dict(item) for item in self.batteries.values()]
+            now = time.time()
+            for item in batteries:
+                item["live"] = bool(item.get("received")) and now - float(item.get("received", 0.0) or 0.0) <= 30.0
+            return {
+                "topic": data.get("topic") or topics.get("batteryLeft") or topics.get("batteryState") or "/ai_worker/battery/left/state",
+                "live": bool(data.get("received")) and now - float(data.get("received", 0.0) or 0.0) <= 30.0,
+                "batteries": batteries,
+                **data,
             }
 
     def depth_snapshot(self) -> dict[str, Any]:
@@ -1029,15 +1592,353 @@ class RosMonitor:
             }
 
     def mission_snapshot(self) -> dict[str, Any]:
+        mission_cfg = mission_robot_config(self.robot_id)
         topic = robot_configs().get(self.robot_id, {}).get("topics", {}).get("missionEvents", "/fms/mission_events")
+        state_labels = {0: "wait", 1: "MISSION OK", 2: "complete"}
+        stage_map = {0: "idle", 1: "ok", 2: "completed"}
+        stale_sec = float(mission_cfg.get("machineStateStaleSec", 0) or 0)
         with self.lock:
+            machine_state_a = dict(self.machine_state_a)
+            machine_state_c = dict(self.machine_state_c)
+            grasp_time = float(self.grasp_poses_time)
+            seq = self.mission_seq
+            events = self.mission_events[-8:]
+
+        def build_section(section_id: str, raw_state: dict[str, Any]) -> dict[str, Any]:
+            cfg = mission_cfg.get("aSection" if section_id == "a" else "cSection", {})
+            effective = effective_machine_section(raw_state, stale_sec)
+            clients = int(effective.get("clients", 0) or 0)
+            state = int(effective.get("state", 0) or 0)
+            if clients <= 0:
+                state = 0
+            summary = str(effective.get("summary") or "") if state == 1 else ""
+            if state == 1 and summary:
+                status_label = f"MISSION OK : {summary}"
+            elif state == 1:
+                status_label = "MISSION OK"
+            else:
+                status_label = "인지 안됨"
             return {
-                "stage": self.mission_stage,
-                "seq": self.mission_seq,
-                "topic": topic,
-                "events": self.mission_events[-8:],
-                "machineState": dict(self.machine_state),
+                "label": str(cfg.get("label", section_id.upper())),
+                "machineState": {
+                    "state": state,
+                    "label": status_label,
+                    "summary": summary,
+                    "service": str(effective.get("service") or ""),
+                    "parts": [str(part) for part in effective.get("parts", []) or []] if state == 1 else [],
+                    "counts": [int(count) for count in effective.get("counts", []) or []] if state == 1 else [],
+                    "updated": float(effective.get("updated", 0.0) or 0.0) if state == 1 else 0.0,
+                    "available": bool(effective.get("available", False)),
+                    "clients": clients,
+                    "error": str(effective.get("error") or ""),
+                },
             }
+
+        section_a = build_section("a", machine_state_a)
+        section_c = build_section("c", machine_state_c)
+        section_states = [
+            int(section_a["machineState"]["state"]),
+            int(section_c["machineState"]["state"]),
+        ]
+        overall_state = max(section_states) if any(section_states) else 0
+
+        return {
+            "stage": stage_map.get(overall_state, "idle"),
+            "seq": seq,
+            "topic": topic,
+            "events": events,
+            "sections": {
+                "a": section_a,
+                "b": {
+                    "label": str(mission_cfg.get("bSection", {}).get("label", "B구간")),
+                },
+                "c": section_c,
+            },
+            "graspPoses": {
+                "topic": str(mission_cfg.get("graspPosesTopic", "/grasp_poses")),
+                "live": grasp_time > 0 and time.time() - grasp_time <= 2.0,
+                "updated": grasp_time,
+            },
+        }
+
+    def update_machine_state_a(self, state: int, parts: list[str], counts: list[int]) -> None:
+        state = max(0, min(2, int(state)))
+        part_names = [str(part) for part in parts]
+        part_counts = [int(count) for count in counts]
+        summary = format_machine_state_summary(part_names, part_counts) if state == 1 else ""
+        stage_map = {0: "idle", 1: "ok", 2: "completed"}
+        with self.lock:
+            service = str(self.machine_state_a.get("service") or "/machine_state_a")
+            self.machine_state_a = {
+                "service": service,
+                "state": state,
+                "parts": part_names,
+                "counts": part_counts,
+                "summary": summary,
+                "available": True,
+                "updated": time.time(),
+                "error": "",
+                "clients": 1,
+            }
+            if state in stage_map:
+                self.mission_stage = stage_map[state]
+
+    def update_machine_state_c(self, state: int, parts: list[str]) -> None:
+        state = max(0, min(2, int(state)))
+        part_names = [str(part) for part in parts]
+        summary = format_machine_state_summary(part_names) if state == 1 else ""
+        stage_map = {0: "idle", 1: "ok", 2: "completed"}
+        with self.lock:
+            service = str(self.machine_state_c.get("service") or "/machine_state_c")
+            self.machine_state_c = {
+                "service": service,
+                "state": state,
+                "parts": part_names,
+                "counts": [],
+                "summary": summary,
+                "available": True,
+                "updated": time.time(),
+                "error": "",
+                "clients": 1,
+            }
+            if state in stage_map:
+                self.mission_stage = stage_map[state]
+
+    def reset_machine_section_idle(self, section: str, error: str = "waiting for OCR") -> None:
+        with self.lock:
+            target = self.machine_state_a if section == "a" else self.machine_state_c
+            service = str(target.get("service") or ("/machine_state_a" if section == "a" else "/machine_state_c"))
+            idle = empty_machine_section(service)
+            idle["available"] = True
+            idle["error"] = str(error or "waiting for OCR")
+            idle["clients"] = 0
+            if section == "a":
+                self.machine_state_a = idle
+            else:
+                self.machine_state_c = idle
+            self.mission_stage = "idle"
+
+    def sync_machine_section_clients(self, section: str, service: str) -> None:
+        clients = count_ros_service_clients(service)
+        with self.lock:
+            target = self.machine_state_a if section == "a" else self.machine_state_c
+            if clients is None:
+                target["clients"] = 0
+                return
+            if clients <= 0:
+                service_name = str(service or ("/machine_state_a" if section == "a" else "/machine_state_c"))
+                idle = empty_machine_section(service_name)
+                idle["available"] = True
+                idle["error"] = "waiting for OCR"
+                idle["clients"] = 0
+                if section == "a":
+                    self.machine_state_a = idle
+                else:
+                    self.machine_state_c = idle
+                self.mission_stage = "idle"
+                return
+            target["clients"] = clients
+
+    def poll_machine_state_clients(self) -> None:
+        cfg = mission_robot_config(self.robot_id)
+        self.sync_machine_section_clients(
+            "a",
+            str(cfg.get("machineStateAService", "/machine_state_a")),
+        )
+        self.sync_machine_section_clients(
+            "c",
+            str(cfg.get("machineStateCService", "/machine_state_c")),
+        )
+
+    def _poll_machine_state_clients_loop(self) -> None:
+        while True:
+            try:
+                self.poll_machine_state_clients()
+            except Exception:
+                pass
+            time.sleep(2.0)
+
+    def set_machine_section_service_status(self, section: str, available: bool, error: str = "") -> None:
+        with self.lock:
+            target = self.machine_state_a if section == "a" else self.machine_state_c
+            target["available"] = bool(available)
+            target["error"] = str(error or "")
+            if not available:
+                target["state"] = 0
+                target["parts"] = []
+                target["counts"] = []
+                target["summary"] = ""
+                target["updated"] = 0.0
+                self.mission_stage = "idle"
+
+    def update_grasp_poses(self, msg: Any) -> None:
+        mission_cfg = mission_robot_config(self.robot_id)
+        conf_min = float(mission_cfg.get("detectionConfidenceMin", 0.25))
+        classes: dict[str, int] = {}
+        for grasp in getattr(msg, "grasps", []) or []:
+            confidence = float(getattr(grasp, "confidence", 0.0) or 0.0)
+            if confidence < conf_min:
+                continue
+            key = normalize_mission_name(getattr(grasp, "class_name", ""))
+            if key:
+                classes[key] = classes.get(key, 0) + 1
+        with self.lock:
+            self.grasp_classes = classes
+            self.grasp_poses_time = time.time()
+
+    def update_task_status(self, text: str) -> None:
+        raw = str(text or "")
+        if "TASK TRACE: /task request received" in raw:
+            match = re.search(r"parts=(\[.*?\])\s+counts=(\[.*?\])", raw)
+            if not match:
+                return
+            try:
+                parts = [str(part) for part in ast.literal_eval(match.group(1))]
+                counts = [int(count) for count in ast.literal_eval(match.group(2))]
+            except Exception:
+                return
+            with self.lock:
+                self.a_parts = parts
+                self.a_counts = counts
+                self.a_accepted = True
+                self.a_parts_time = time.time()
+            return
+        if "TASK TRACE: /task_c request received" in raw:
+            match = re.search(r"parts=(\[.*?\])", raw)
+            if not match:
+                return
+            try:
+                parts = [str(part) for part in ast.literal_eval(match.group(1))]
+            except Exception:
+                return
+            with self.lock:
+                self.c_parts = parts
+                self.c_accepted = True
+                self.c_parts_time = time.time()
+
+    def ros_camera_status(self, camera_id: str) -> dict[str, Any]:
+        with self.camera_condition:
+            frame = self.camera_frames.get(camera_id, {})
+            stamp = float(frame.get("stamp", 0.0) or 0.0)
+            received = float(frame.get("received", 0.0) or 0.0)
+            cam = next((item for item in camera_config() if str(item.get("id")) == camera_id), {})
+            live_timeout = float(cam.get("liveTimeoutSec", 3.0 if camera_uses_web_video(cam) else 1.5))
+            return {
+                "live": received > 0 and time.time() - received <= live_timeout,
+                "stamp": stamp,
+                "received": received,
+                "seq": int(frame.get("seq", 0) or 0),
+                "topic": str(frame.get("topic", "")),
+                "width": int(frame.get("width", 0) or 0),
+                "height": int(frame.get("height", 0) or 0),
+                "error": str(frame.get("error", "")),
+                "liveTimeoutSec": live_timeout,
+            }
+
+    def update_ros_camera_frame(
+        self,
+        camera_id: str,
+        topic: str,
+        frame: np.ndarray,
+        stamp: float,
+        quality: int,
+        cache_jpeg: bool = True,
+        store_frame: bool = True,
+        encoded_jpeg: bytes | None = None,
+    ) -> None:
+        encoded: bytes = b""
+        if cache_jpeg:
+            if encoded_jpeg:
+                encoded = bytes(encoded_jpeg)
+            else:
+                ok, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+                if not ok:
+                    return
+                encoded = jpg.tobytes()
+        height, width = frame.shape[:2]
+        received = time.time()
+        with self.camera_condition:
+            previous = self.camera_frames.get(camera_id, {})
+            self.camera_frames[camera_id] = {
+                "frame": frame.copy() if store_frame else None,
+                "jpeg": encoded,
+                "stamp": stamp,
+                "received": received,
+                "seq": int(previous.get("seq", 0) or 0) + 1,
+                "topic": topic,
+                "width": int(width),
+                "height": int(height),
+                "error": "",
+            }
+            self.camera_condition.notify_all()
+
+    def update_ros_camera_jpeg(
+        self,
+        camera_id: str,
+        topic: str,
+        jpeg: bytes,
+        stamp: float,
+        width: int,
+        height: int,
+    ) -> None:
+        if not jpeg:
+            return
+        received = time.time()
+        with self.camera_condition:
+            previous = self.camera_frames.get(camera_id, {})
+            self.camera_frames[camera_id] = {
+                "frame": None,
+                "jpeg": bytes(jpeg),
+                "stamp": stamp,
+                "received": received,
+                "seq": int(previous.get("seq", 0) or 0) + 1,
+                "topic": topic,
+                "width": int(width),
+                "height": int(height),
+                "error": "",
+            }
+            self.camera_condition.notify_all()
+
+    def update_ros_camera_error(self, camera_id: str, topic: str, error: str) -> None:
+        with self.camera_condition:
+            previous = self.camera_frames.get(camera_id, {})
+            self.camera_frames[camera_id] = {**previous, "topic": topic, "error": error}
+            self.camera_condition.notify_all()
+
+    def latest_ros_camera_jpeg(
+        self,
+        camera_id: str,
+        max_age: float = 0.45,
+        wait_timeout: float = 0.0,
+        min_stamp: float = 0.0,
+    ) -> tuple[bytes, float, int]:
+        with self.camera_condition:
+            if wait_timeout > 0:
+                self.camera_condition.wait_for(
+                    lambda: bool(self.camera_frames.get(camera_id, {}).get("jpeg"))
+                    and (not min_stamp or float(self.camera_frames.get(camera_id, {}).get("stamp", 0.0) or 0.0) >= min_stamp),
+                    timeout=wait_timeout,
+                )
+            frame = self.camera_frames.get(camera_id, {})
+            jpeg = bytes(frame.get("jpeg", b"") or b"")
+            stamp = float(frame.get("stamp", 0.0) or 0.0)
+            received = float(frame.get("received", 0.0) or 0.0)
+            seq = int(frame.get("seq", 0) or 0)
+            if not jpeg or not stamp or not received or time.time() - received > max_age:
+                return b"", stamp, seq
+            if min_stamp and stamp < min_stamp:
+                return b"", stamp, seq
+            return jpeg, stamp, seq
+
+    def latest_ros_camera_frame(self, camera_id: str, max_age: float = 0.35) -> tuple[np.ndarray | None, float]:
+        with self.camera_condition:
+            data = self.camera_frames.get(camera_id, {})
+            frame = data.get("frame")
+            stamp = float(data.get("stamp", 0.0) or 0.0)
+            received = float(data.get("received", 0.0) or 0.0)
+            if frame is None or not stamp or not received or time.time() - received > max_age:
+                return None, stamp
+            return frame.copy(), stamp
 
     def send_mission_signal(self, signal: str) -> dict[str, Any]:
         normalized = str(signal or "").strip().lower()
@@ -1049,15 +1950,8 @@ class RosMonitor:
             "ok": "OK_SIGN",
             "reset": "RESET",
         }
-        stages = {
-            "start": "started",
-            "complete": "completed",
-            "ok": "ok",
-            "reset": "idle",
-        }
         with self.lock:
             self.mission_seq += 1
-            self.mission_stage = stages[normalized]
             event = {
                 "seq": self.mission_seq,
                 "signal": normalized,
@@ -1080,6 +1974,12 @@ class RosMonitor:
             try:
                 robot = robot_configs().get(self.robot_id, {})
                 depth = robot.get("depthSensor", {})
+                if not direct_video_enabled():
+                    with self.lock:
+                        if not self.depth_source:
+                            self.depth_error = "direct video depth fallback disabled"
+                    time.sleep(1.0)
+                    continue
                 device = depth.get("fallbackDevice", "")
                 if not device or not Path(device).exists():
                     time.sleep(1.0)
@@ -1195,6 +2095,9 @@ class RosMonitor:
             from rclpy.node import Node
             from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
             from sensor_msgs.msg import JointState
+            from sensor_msgs.msg import BatteryState
+            from sensor_msgs.msg import Image as RosImage
+            from sensor_msgs.msg import CompressedImage as RosCompressedImage
             from tf2_msgs.msg import TFMessage
         except Exception as exc:
             with self.lock:
@@ -1221,24 +2124,87 @@ class RosMonitor:
         except Exception:
             String = None
 
+        MachineStateA = None
+        MachineStateC = None
+        GraspPoseArray = None
+        try:
+            from humanoid_msgs.srv import MachineStateA as MachineStateASrv
+            from humanoid_msgs.srv import MachineStateC as MachineStateCSrv
+            from humanoid_msgs.msg import GraspPoseArray as GraspPoseArrayMsg
+
+            MachineStateA = MachineStateASrv
+            MachineStateC = MachineStateCSrv
+            GraspPoseArray = GraspPoseArrayMsg
+        except Exception:
+            MachineStateA = None
+            MachineStateC = None
+            GraspPoseArray = None
+
+        mission_cfg = mission_robot_config(self.robot_id)
         robots = robot_configs()
-        robot = robots.get(self.robot_id) or robots.get("unitree") or {}
+        robot = robots.get(self.robot_id) or robots.get("ai_worker") or {}
         topics = robot.get("topics", {})
-        mission_config = robot.get("mission", {})
         joint_topic = topics.get("jointStates", "/joint_states")
         tf_topic = topics.get("tf", "/tf")
         tf_static_topic = topics.get("tfStatic", "/tf_static")
+        battery_topics = [
+            str(topic)
+            for topic in [
+                topics.get("batteryLeft", ""),
+                topics.get("batteryRight", ""),
+                topics.get("batteryState", ""),
+                topics.get("battery", ""),
+                topics.get("batteryTopic", ""),
+                "/ai_worker/battery/left/state",
+                "/ai_worker/battery/right/state",
+            ]
+            if topic
+        ]
+        battery_topics = list(dict.fromkeys(battery_topics))
         low_state_topic = topics.get("lowState", "")
         low_state_lf_topic = topics.get("lowStateLf", "")
         low_state_joint_names = [name for name in robot.get("lowStateJointNames", []) if name]
         depth_config = robot.get("depthSensor", {})
-        point_cloud_topic = depth_config.get("pointCloudTopic") or topics.get("pointCloud", "")
+        point_cloud_topics = [
+            str(topic)
+            for topic in [
+                depth_config.get("pointCloudTopic"),
+                *depth_config.get("pointCloudTopicCandidates", []),
+                topics.get("pointCloud", ""),
+            ]
+            if topic
+        ]
+        point_cloud_topics = list(dict.fromkeys(point_cloud_topics))
+        depth_image_topics = [
+            str(topic)
+            for topic in [
+                depth_config.get("depthImageTopic"),
+                *depth_config.get("depthImageTopicCandidates", []),
+                topics.get("depthImage", ""),
+            ]
+            if topic
+        ]
+        depth_image_topics = list(dict.fromkeys(depth_image_topics))
+        compressed_depth_topics = [
+            str(topic)
+            for topic in [
+                depth_config.get("compressedDepthTopic"),
+                *depth_config.get("compressedDepthTopicCandidates", []),
+            ]
+            if topic
+        ]
+        compressed_depth_topics = list(dict.fromkeys(compressed_depth_topics))
         mission_topic = topics.get("missionEvents", "/fms/mission_events")
-        machine_state_service = mission_config.get("machineStateService", "/machine_state")
-        machine_state_service_type = mission_config.get("machineStateServiceType", "")
+        ros_cameras = [cam for cam in camera_config() if is_ros_camera(cam)]
         max_depth_points = max(100, min(80000, int(depth_config.get("maxPoints", 2400))))
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        reliable_sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
@@ -1260,56 +2226,93 @@ class RosMonitor:
             except Exception as exc:
                 low_state_error = f"{type(exc).__name__}: {exc}"
 
-        def import_service_type(type_name: str):
-            normalized = str(type_name or "").strip().replace("/", ".")
-            parts = [part for part in normalized.split(".") if part]
-            if len(parts) < 3 or parts[-2] != "srv":
-                raise ValueError(f"unsupported service type: {type_name}")
-            return getattr(importlib.import_module(".".join(parts[:-1])), parts[-1])
-
-        def response_state_value(response: Any) -> int:
-            for attr in ("state", "data", "status", "mission_state", "machine_state"):
-                if hasattr(response, attr):
-                    try:
-                        return int(getattr(response, attr))
-                    except Exception:
-                        return 0
-            return 0
-
         try:
             rclpy.init(args=None)
 
             class FmsRosNode(Node):
                 def __init__(node_self):
                     super().__init__("humanoid_fms_monitor")
-                    node_self.machine_state_service = machine_state_service
-                    node_self.machine_state_service_type_name = machine_state_service_type
-                    node_self.machine_state_service_type = None
-                    node_self.machine_state_client = None
-                    node_self.machine_state_future = None
-                    node_self.machine_state_request_time = 0.0
-                    node_self.machine_state_next_attempt = 0.0
-                    node_self.machine_state_timeout = 0.8
                     node_self.create_subscription(JointState, joint_topic, node_self.on_joint, sensor_qos)
                     node_self.create_subscription(TFMessage, tf_topic, node_self.on_tf, sensor_qos)
                     node_self.create_subscription(TFMessage, tf_static_topic, node_self.on_tf, tf_static_qos)
-                    if point_cloud_topic and PointCloud2 is not None:
-                        node_self.create_subscription(PointCloud2, point_cloud_topic, node_self.on_point_cloud, sensor_qos)
+                    for topic in battery_topics:
+                        node_self.create_subscription(
+                            BatteryState,
+                            topic,
+                            lambda msg, topic=topic: node_self.on_battery(topic, msg),
+                            reliable_sensor_qos,
+                        )
+                    if PointCloud2 is not None:
+                        for topic in point_cloud_topics:
+                            node_self.create_subscription(
+                                PointCloud2,
+                                topic,
+                                lambda msg, topic=topic: node_self.on_point_cloud(topic, msg),
+                                sensor_qos,
+                            )
+                    for topic in depth_image_topics:
+                        node_self.create_subscription(
+                            RosImage,
+                            topic,
+                            lambda msg, topic=topic: node_self.on_depth_image(topic, msg),
+                            sensor_qos,
+                        )
+                    for topic in compressed_depth_topics:
+                        node_self.create_subscription(
+                            RosCompressedImage,
+                            topic,
+                            lambda msg, topic=topic: node_self.on_compressed_depth_image(topic, msg),
+                            reliable_sensor_qos,
+                        )
+                    for cam in ros_cameras:
+                        camera_id = str(cam["id"])
+                        for topic in cam.get("topicCandidates", []):
+                            node_self.create_subscription(
+                                RosImage,
+                                str(topic),
+                                lambda msg, camera_id=camera_id, topic=str(topic), cam=dict(cam): node_self.on_camera_image(camera_id, topic, cam, msg),
+                                sensor_qos,
+                            )
+                        for topic in cam.get("compressedTopicCandidates", []):
+                            node_self.create_subscription(
+                                RosCompressedImage,
+                                str(topic),
+                                lambda msg, camera_id=camera_id, topic=str(topic), cam=dict(cam): node_self.on_camera_compressed(camera_id, topic, cam, msg),
+                                sensor_qos,
+                            )
                     node_self.mission_pub = node_self.create_publisher(String, mission_topic, 10) if String else None
                     node_self.create_timer(0.1, node_self.publish_mission_events)
-                    node_self.create_timer(0.2, node_self.poll_machine_state)
+                    machine_state_a_service = str(mission_cfg.get("machineStateAService", "/machine_state_a"))
+                    machine_state_c_service = str(mission_cfg.get("machineStateCService", "/machine_state_c"))
+                    if MachineStateA is not None:
+                        node_self.create_service(MachineStateA, machine_state_a_service, node_self.on_machine_state_a)
+                        self.set_machine_section_service_status("a", True, "waiting for OCR")
+                    else:
+                        self.set_machine_section_service_status("a", False, "MachineStateA.srv unavailable")
+                    if MachineStateC is not None:
+                        node_self.create_service(MachineStateC, machine_state_c_service, node_self.on_machine_state_c)
+                        self.set_machine_section_service_status("c", True, "waiting for OCR")
+                    else:
+                        self.set_machine_section_service_status("c", False, "MachineStateC.srv unavailable")
+                    grasp_poses_topic = str(mission_cfg.get("graspPosesTopic", "/grasp_poses"))
+                    if GraspPoseArray is not None and grasp_poses_topic:
+                        node_self.create_subscription(
+                            GraspPoseArray,
+                            grasp_poses_topic,
+                            node_self.on_grasp_poses,
+                            sensor_qos,
+                        )
+                    task_status_topic = str(mission_cfg.get("taskStatusTopic", "/task/status"))
+                    if String is not None and task_status_topic:
+                        node_self.create_subscription(
+                            String,
+                            task_status_topic,
+                            node_self.on_task_status,
+                            reliable_sensor_qos,
+                        )
                     if low_state_msg_type and low_state_joint_names:
                         for topic in {low_state_topic, low_state_lf_topic} - {""}:
                             node_self.create_subscription(low_state_msg_type, topic, node_self.on_low_state, sensor_qos)
-                    with self.lock:
-                        self.machine_state_service = machine_state_service
-                        self.machine_state = {
-                            "service": machine_state_service,
-                            "state": 0,
-                            "available": False,
-                            "updated": 0.0,
-                            "error": "waiting for service",
-                        }
 
                 def on_joint(node_self, msg):
                     now = time.time()
@@ -1365,8 +2368,72 @@ class RosMonitor:
                             self.source = "tf"
                         self.error = ""
 
-                def on_point_cloud(node_self, msg):
+                def on_battery(node_self, topic, msg):
                     now = time.time()
+                    topic_labels = {
+                        str(topics.get("batteryLeft", "")): "Left Battery",
+                        str(topics.get("batteryRight", "")): "Right Battery",
+                        "/ai_worker/battery/left/state": "Left Battery",
+                        "/ai_worker/battery/right/state": "Right Battery",
+                    }
+                    status_labels = {
+                        0: "unknown",
+                        1: "charging",
+                        2: "discharging",
+                        3: "not charging",
+                        4: "full",
+                    }
+                    health_labels = {
+                        0: "unknown",
+                        1: "good",
+                        2: "overheat",
+                        3: "dead",
+                        4: "overvoltage",
+                        5: "unspecified failure",
+                        6: "cold",
+                        7: "watchdog timer expire",
+                        8: "safety timer expire",
+                    }
+                    def clean_float(value):
+                        try:
+                            number = float(value)
+                        except (TypeError, ValueError):
+                            return None
+                        return round(number, 3) if np.isfinite(number) else None
+
+                    percentage = clean_float(getattr(msg, "percentage", None))
+                    percentage = round(percentage * 100.0, 1) if percentage is not None and percentage <= 1.0 else percentage
+                    with self.lock:
+                        battery = {
+                            "label": topic_labels.get(topic, "Battery"),
+                            "topic": topic,
+                            "stamp": ros_time_to_float(msg.header.stamp) if getattr(msg, "header", None) else 0.0,
+                            "received": now,
+                            "percentage": percentage,
+                            "voltage": clean_float(getattr(msg, "voltage", None)),
+                            "current": clean_float(getattr(msg, "current", None)),
+                            "charge": clean_float(getattr(msg, "charge", None)),
+                            "capacity": clean_float(getattr(msg, "capacity", None)),
+                            "designCapacity": clean_float(getattr(msg, "design_capacity", None)),
+                            "temperature": clean_float(getattr(msg, "temperature", None)),
+                            "powerSupplyStatus": int(getattr(msg, "power_supply_status", 0) or 0),
+                            "powerSupplyStatusText": status_labels.get(int(getattr(msg, "power_supply_status", 0) or 0), "unknown"),
+                            "powerSupplyHealth": int(getattr(msg, "power_supply_health", 0) or 0),
+                            "powerSupplyHealthText": health_labels.get(int(getattr(msg, "power_supply_health", 0) or 0), "unknown"),
+                        }
+                        self.batteries[topic] = battery
+                        self.battery = battery
+                        self.last_battery_time = now
+                        if self.source not in {"live", "lowstate"}:
+                            self.source = "battery"
+                        self.error = ""
+
+                def on_point_cloud(node_self, topic, msg):
+                    now = time.time()
+                    depth_interval = 1.0 / max(1.0, float(depth_config.get("depthStreamFps", 10)))
+                    with self.lock:
+                        if self.last_depth_time and now - self.last_depth_time < depth_interval:
+                            return
                     total = int(msg.width or 0) * int(msg.height or 0)
                     stride = max(1, total // max_depth_points) if total else 1
                     points: list[list[float]] = []
@@ -1393,82 +2460,159 @@ class RosMonitor:
                             self.last_depth_time = now
                             self.depth_total = total
                             self.depth_nearest = round(nearest, 3)
-                            self.depth_source = "ros"
+                            self.depth_source = f"ros:{topic}"
                             self.depth_error = ""
                     except Exception as exc:
                         with self.lock:
                             self.depth_error = f"{type(exc).__name__}: {exc}"
 
-                def set_machine_state(node_self, state_value: int, available: bool, error: str = ""):
-                    with self.lock:
-                        self.machine_state = {
-                            "service": node_self.machine_state_service,
-                            "state": int(state_value),
-                            "available": bool(available),
-                            "updated": time.time() if available else 0.0,
-                            "error": error,
-                        }
-
-                def ensure_machine_state_client(node_self) -> bool:
-                    if node_self.machine_state_client is not None:
-                        return True
-                    service_type_name = node_self.machine_state_service_type_name
-                    if not service_type_name:
-                        for name, type_names in node_self.get_service_names_and_types():
-                            if name == node_self.machine_state_service and type_names:
-                                service_type_name = type_names[0]
-                                break
-                    if not service_type_name:
-                        node_self.set_machine_state(0, False, "service not found")
-                        return False
+                def on_depth_image(node_self, topic, msg):
                     try:
-                        node_self.machine_state_service_type = import_service_type(service_type_name)
-                        node_self.machine_state_service_type_name = service_type_name
-                        node_self.machine_state_client = node_self.create_client(
-                            node_self.machine_state_service_type,
-                            node_self.machine_state_service,
-                        )
-                        return True
-                    except Exception as exc:
-                        node_self.machine_state_client = None
-                        node_self.set_machine_state(0, False, f"{type(exc).__name__}: {exc}")
-                        return False
-
-                def poll_machine_state(node_self):
-                    now = time.time()
-                    if node_self.machine_state_future is not None:
-                        if node_self.machine_state_future.done():
-                            future = node_self.machine_state_future
-                            node_self.machine_state_future = None
-                            try:
-                                node_self.set_machine_state(response_state_value(future.result()), True, "")
-                            except Exception as exc:
-                                node_self.set_machine_state(0, False, f"{type(exc).__name__}: {exc}")
-                        elif now - node_self.machine_state_request_time > node_self.machine_state_timeout:
-                            try:
-                                node_self.machine_state_future.cancel()
-                            except Exception:
-                                pass
-                            node_self.machine_state_future = None
-                            node_self.set_machine_state(0, False, "service timeout")
-                        else:
+                        if str(getattr(msg, "encoding", "") or "").lower() not in {"16uc1", "mono16", "32fc1"}:
                             return
-                    if now < node_self.machine_state_next_attempt:
-                        return
-                    node_self.machine_state_next_attempt = now + 0.5
-                    if not node_self.ensure_machine_state_client():
-                        return
-                    try:
-                        if not node_self.machine_state_client.service_is_ready():
-                            if not node_self.machine_state_client.wait_for_service(timeout_sec=0.0):
-                                node_self.set_machine_state(0, False, "service unavailable")
+                        now = time.time()
+                        depth_interval = 1.0 / max(1.0, float(depth_config.get("depthStreamFps", 10)))
+                        with self.lock:
+                            if self.last_depth_time and now - self.last_depth_time < depth_interval:
                                 return
-                        request = node_self.machine_state_service_type.Request()
-                        node_self.machine_state_future = node_self.machine_state_client.call_async(request)
-                        node_self.machine_state_request_time = now
+                        frame = decode_ros_depth_image(msg, float(depth_config.get("depthScaleMeters", 0.001)))
+                        color_frame = None
+                        color_camera_id = str(depth_config.get("depthRgbCameraId", "realsense_d455"))
+                        if str(depth_config.get("depthViewMode", "depth_only")) == "rgb_overlay" and color_camera_id:
+                            color_frame, _ = latest_camera_frame(color_camera_id, max_age=0.5)
+                        depth_view_jpg = depth_view_from_z16(frame, depth_config, color_frame=color_frame)
+                        assist_interval = max(0.05, float(depth_config.get("assistUpdateInterval", 0.2)))
+                        assist_overlay_png = None
+                        assist_stats = None
+                        with self.lock:
+                            should_update_assist = (
+                                not self.depth_assist_overlay_png
+                                or now - self.depth_assist_time >= assist_interval
+                            )
+                        if should_update_assist:
+                            assist_overlay_png, assist_stats = depth_assist_overlay_from_z16(frame, depth_config)
+                        with self.lock:
+                            self.depth_raw_frame = frame.copy()
+                            self.depth_raw_frame_time = now
+                            self.depth_view_jpg = depth_view_jpg
+                            if assist_overlay_png is not None and assist_stats is not None:
+                                self.depth_assist_overlay_png = assist_overlay_png
+                                self.depth_assist_stats = assist_stats
+                                self.depth_assist_time = now
+                                self.depth_stats = {**self.depth_stats, **assist_stats}
+                                fallback_nearest = float(
+                                    assist_stats.get("globalNearestMeters")
+                                    or assist_stats.get("targetNearestMeters")
+                                    or 0.0
+                                )
+                                if fallback_nearest:
+                                    self.depth_nearest = round(fallback_nearest, 3)
+                            self.depth_frame = msg.header.frame_id
+                            self.last_depth_time = now
+                            self.depth_total = int(frame.size)
+                            self.depth_source = f"ros-depth:{topic}"
+                            self.depth_error = ""
                     except Exception as exc:
-                        node_self.machine_state_future = None
-                        node_self.set_machine_state(0, False, f"{type(exc).__name__}: {exc}")
+                        with self.lock:
+                            self.depth_error = f"depth image {type(exc).__name__}: {exc}"
+
+                def on_compressed_depth_image(node_self, topic, msg):
+                    try:
+                        now = time.time()
+                        depth_interval = 1.0 / max(1.0, float(depth_config.get("depthStreamFps", 10)))
+                        with self.lock:
+                            if self.last_depth_time and now - self.last_depth_time < depth_interval:
+                                return
+                        frame = decode_ros_compressed_depth_image(msg, float(depth_config.get("depthScaleMeters", 0.001)))
+                        depth_view_jpg = depth_view_from_z16(frame, depth_config)
+                        assist_interval = max(0.05, float(depth_config.get("assistUpdateInterval", 0.2)))
+                        assist_overlay_png = None
+                        assist_stats = None
+                        with self.lock:
+                            should_update_assist = (
+                                not self.depth_assist_overlay_png
+                                or now - self.depth_assist_time >= assist_interval
+                            )
+                        if should_update_assist:
+                            assist_overlay_png, assist_stats = depth_assist_overlay_from_z16(frame, depth_config)
+                        with self.lock:
+                            self.depth_raw_frame = frame.copy()
+                            self.depth_raw_frame_time = now
+                            self.depth_view_jpg = depth_view_jpg
+                            if assist_overlay_png is not None and assist_stats is not None:
+                                self.depth_assist_overlay_png = assist_overlay_png
+                                self.depth_assist_stats = assist_stats
+                                self.depth_assist_time = now
+                                self.depth_stats = {**self.depth_stats, **assist_stats}
+                                fallback_nearest = float(
+                                    assist_stats.get("globalNearestMeters")
+                                    or assist_stats.get("targetNearestMeters")
+                                    or 0.0
+                                )
+                                if fallback_nearest:
+                                    self.depth_nearest = round(fallback_nearest, 3)
+                            self.depth_frame = msg.header.frame_id
+                            self.last_depth_time = now
+                            self.depth_total = int(frame.size)
+                            self.depth_source = f"ros-compressed-depth:{topic}"
+                            self.depth_error = ""
+                    except Exception as exc:
+                        with self.lock:
+                            self.depth_error = f"compressed depth {type(exc).__name__}: {exc}"
+
+                def on_camera_image(node_self, camera_id, topic, cam, msg):
+                    try:
+                        frame = decode_ros_image(msg)
+                        quality = max(70, min(95, int(cam.get("jpegQuality", 84))))
+                        use_web_video = camera_uses_web_video(cam)
+                        self.update_ros_camera_frame(
+                            camera_id,
+                            topic,
+                            frame,
+                            ros_time_to_float(msg.header.stamp),
+                            quality,
+                            cache_jpeg=not use_web_video,
+                            store_frame=not use_web_video,
+                        )
+                    except Exception as exc:
+                        self.update_ros_camera_error(camera_id, topic, f"{type(exc).__name__}: {exc}")
+
+                def on_camera_compressed(node_self, camera_id, topic, cam, msg):
+                    try:
+                        jpeg_bytes = bytes(msg.data)
+                        use_web_video = camera_uses_web_video(cam)
+                        if use_web_video:
+                            width, height = jpeg_dimensions(jpeg_bytes)
+                            if width <= 0 or height <= 0:
+                                resolution = cam.get("resolution") or [0, 0]
+                                width = int(resolution[0] or 0)
+                                height = int(resolution[1] or 0)
+                            self.update_ros_camera_jpeg(
+                                camera_id,
+                                topic,
+                                jpeg_bytes,
+                                ros_time_to_float(msg.header.stamp),
+                                width,
+                                height,
+                            )
+                            return
+                        data = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+                        frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
+                        if frame is None:
+                            raise ValueError("compressed image decode failed")
+                        quality = max(70, min(95, int(cam.get("jpegQuality", 84))))
+                        self.update_ros_camera_frame(
+                            camera_id,
+                            topic,
+                            frame,
+                            ros_time_to_float(msg.header.stamp),
+                            quality,
+                            cache_jpeg=True,
+                            store_frame=not use_web_video,
+                            encoded_jpeg=jpeg_bytes,
+                        )
+                    except Exception as exc:
+                        self.update_ros_camera_error(camera_id, topic, f"{type(exc).__name__}: {exc}")
 
                 def publish_mission_events(node_self):
                     if not node_self.mission_pub:
@@ -1480,6 +2624,25 @@ class RosMonitor:
                         msg = String()
                         msg.data = json.dumps(event, separators=(",", ":"))
                         node_self.mission_pub.publish(msg)
+
+                def on_machine_state_a(node_self, request, response):
+                    parts = [str(part) for part in getattr(request, "parts", []) or []]
+                    counts = [int(count) for count in getattr(request, "count", []) or []]
+                    self.update_machine_state_a(int(getattr(request, "state", 0)), parts, counts)
+                    response.response = True
+                    return response
+
+                def on_machine_state_c(node_self, request, response):
+                    parts = [str(part) for part in getattr(request, "parts", []) or []]
+                    self.update_machine_state_c(int(getattr(request, "state", 0)), parts)
+                    response.response = True
+                    return response
+
+                def on_grasp_poses(node_self, msg):
+                    self.update_grasp_poses(msg)
+
+                def on_task_status(node_self, msg):
+                    self.update_task_status(str(getattr(msg, "data", "") or ""))
 
             node = FmsRosNode()
             with self.lock:
@@ -1499,8 +2662,7 @@ class RosMonitor:
 
 def ros_topics() -> dict[str, Any]:
     candidates = [
-        "[ -f /opt/ros/humble/setup.bash ] && source /opt/ros/humble/setup.bash >/dev/null 2>&1 && command -v ros2 >/dev/null && timeout 1.2 ros2 topic list -t",
-        "[ -f /opt/ros/foxy/setup.bash ] && source /opt/ros/foxy/setup.bash >/dev/null 2>&1 && command -v ros2 >/dev/null && timeout 1.2 ros2 topic list -t",
+        "[ -f /opt/ros/jazzy/setup.bash ] && source /opt/ros/jazzy/setup.bash >/dev/null 2>&1 && command -v ros2 >/dev/null && timeout 1.2 ros2 topic list -t",
         "command -v ros2 >/dev/null && timeout 1.2 ros2 topic list -t",
     ]
     for command in candidates:
@@ -1523,6 +2685,26 @@ def ros_topics() -> dict[str, Any]:
 def camera_status() -> list[dict[str, Any]]:
     status = []
     for cam in camera_config():
+        if is_ros_camera(cam):
+            ros_status = _ROS_MONITOR.ros_camera_status(str(cam["id"])) if _ROS_MONITOR else {"live": False, "topic": "", "error": "ROS monitor not started"}
+            use_web_video = camera_uses_web_video(cam)
+            width = int(ros_status.get("width", 0) or 0)
+            height = int(ros_status.get("height", 0) or 0)
+            status.append(
+                {
+                    **cam,
+                    "resolution": [width, height] if width > 0 and height > 0 else cam.get("resolution", [640, 480]),
+                    "exists": bool(ros_status.get("live")),
+                    "resolved": web_video_topic(cam, ros_status) if use_web_video else ros_status.get("topic", ""),
+                    "busy": False,
+                    "users": [],
+                    "v4l2": {"available": False, "summary": "ROS topic source"},
+                    "stream": f"/stream/{cam['id']}",
+                    "webVideoTopic": web_video_topic(cam, ros_status),
+                    "ros": ros_status,
+                }
+            )
+            continue
         device = cam["device"]
         resolved = resolve_device(device)
         users = process_users(device)
@@ -1548,8 +2730,12 @@ def get_config() -> JSONResponse:
         {
             "cameras": camera_config(),
             "robots": robot_configs(),
-            "defaultRobot": "unitree",
-            "runtime": {"hostOnly": True, "port": int(os.getenv("FMS_PORT", "8787"))},
+            "defaultRobot": "ai_worker",
+            "runtime": {
+                "hostOnly": True,
+                "port": int(os.getenv("FMS_PORT", "8787")),
+                "webVideoServer": web_video_server_config(),
+            },
         }
     )
 
@@ -1611,6 +2797,100 @@ def get_depth_state() -> JSONResponse:
     if _ROS_MONITOR is None:
         return JSONResponse({"source": "not-started", "points": [], "config": {}})
     return JSONResponse(_ROS_MONITOR.depth_snapshot())
+
+
+@app.get("/api/audio")
+def get_audio_state() -> JSONResponse:
+    return JSONResponse(
+        {
+            "files": audio_files(),
+            "devices": audio_devices(),
+            **audio_playback_state(),
+        }
+    )
+
+
+@app.post("/api/audio/upload")
+async def upload_audio(file: UploadFile = File(...)) -> JSONResponse:
+    name = safe_audio_name(file.filename or "")
+    target = AUDIO_DIR / name
+    size = 0
+    try:
+        with target.open("wb") as fp:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > 40 * 1024 * 1024:
+                    target.unlink(missing_ok=True)
+                    raise HTTPException(status_code=413, detail="audio file too large")
+                fp.write(chunk)
+    finally:
+        await file.close()
+    return JSONResponse({"ok": True, "file": {"name": name, "size": size}})
+
+
+@app.post("/api/audio/play")
+def play_audio(payload: dict[str, Any] = Body(default_factory=dict)) -> JSONResponse:
+    global _AUDIO_PROC, _AUDIO_CURRENT
+    name = safe_audio_name(str(payload.get("name", "")))
+    path = AUDIO_DIR / name
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="audio file missing")
+    stop_audio_playback()
+    device = str(payload.get("device") or audio_device())
+    if audio_backend() == "pulse":
+        subprocess.run(
+            ["pactl", "set-sink-volume", device, f"{audio_volume_percent()}%"],
+            text=True,
+            capture_output=True,
+            timeout=2,
+            check=False,
+            env=audio_env(),
+        )
+    command = audio_command(path, device)
+    with AUDIO_LOG.open("ab") as log:
+        log.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] play {name} via {audio_backend()} {device}\n".encode())
+    log_fp = AUDIO_LOG.open("ab")
+    proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=log_fp, env=audio_env())
+    log_fp.close()
+    time.sleep(0.15)
+    if proc.poll() is not None:
+        raise HTTPException(status_code=500, detail=audio_log_tail() or "audio playback failed")
+    with _AUDIO_LOCK:
+        _AUDIO_PROC = proc
+        _AUDIO_CURRENT = name
+    return JSONResponse({"ok": True, "playing": name, "device": device, "backend": audio_backend(), "volumePercent": audio_volume_percent()})
+
+
+@app.post("/api/audio/stop")
+def stop_audio() -> JSONResponse:
+    stop_audio_playback()
+    return JSONResponse({"ok": True, **audio_playback_state()})
+
+
+@app.post("/api/audio/delete")
+def delete_audio(payload: dict[str, Any] = Body(default_factory=dict)) -> JSONResponse:
+    name = safe_audio_name(str(payload.get("name", "")))
+    path = AUDIO_DIR / name
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="audio file missing")
+    if not path.is_file():
+        raise HTTPException(status_code=400, detail="invalid audio path")
+    with _AUDIO_LOCK:
+        playing = _AUDIO_CURRENT == name and _AUDIO_PROC and _AUDIO_PROC.poll() is None
+    if playing:
+        stop_audio_playback()
+    path.unlink()
+    return JSONResponse(
+        {
+            "ok": True,
+            "deleted": name,
+            "files": audio_files(),
+            **audio_playback_state(),
+        }
+    )
 
 
 @app.get("/api/depth-preview.png")
@@ -1694,6 +2974,9 @@ def get_status() -> JSONResponse:
     now = time.time()
     if _STATUS_CACHE["data"] is not None and now - float(_STATUS_CACHE["time"]) < 8.0:
         return JSONResponse(_STATUS_CACHE["data"])
+    ros = ros_topics()
+    if _ROS_MONITOR is not None:
+        ros["battery"] = _ROS_MONITOR.battery_snapshot()
     data = {
         "time": now,
         "cameras": camera_status(),
@@ -1701,13 +2984,15 @@ def get_status() -> JSONResponse:
             "containers": docker_containers(),
             "deviceAccess": docker_device_access(),
         },
-        "ros": ros_topics(),
+        "ros": ros,
     }
     _STATUS_CACHE.update({"time": now, "data": data})
     return JSONResponse(data)
 
 
 def open_capture(cam: dict[str, Any]):
+    if not direct_video_enabled():
+        raise HTTPException(status_code=503, detail="direct video device capture disabled")
     candidates = cam.get("captureCandidates") or [cam["device"]]
     width, height = cam.get("resolution", [640, 360])
     fps = max(1, int(cam.get("fps", 15)))
@@ -1804,12 +3089,22 @@ class CameraStreamWorker:
                 return None, self.stamp
             return self.frame.copy(), self.stamp
 
-    def latest_jpeg(self, max_age: float = 0.35, wait_timeout: float = 0.0) -> tuple[bytes, float, int]:
+    def latest_jpeg(
+        self,
+        max_age: float = 0.35,
+        wait_timeout: float = 0.0,
+        min_stamp: float = 0.0,
+    ) -> tuple[bytes, float, int]:
         self.start()
         with self.condition:
-            if wait_timeout > 0 and not self.jpeg:
-                self.condition.wait_for(lambda: bool(self.jpeg), timeout=wait_timeout)
+            if wait_timeout > 0:
+                self.condition.wait_for(
+                    lambda: bool(self.jpeg) and (not min_stamp or self.stamp >= min_stamp),
+                    timeout=wait_timeout,
+                )
             if not self.jpeg or not self.stamp or time.time() - self.stamp > max_age:
+                return b"", self.stamp, self.seq
+            if min_stamp and self.stamp < min_stamp:
                 return b"", self.stamp, self.seq
             return self.jpeg, self.stamp, self.seq
 
@@ -1843,7 +3138,131 @@ def latest_camera_frame(camera_id: str, max_age: float = 0.35) -> tuple[np.ndarr
     cam = cams.get(camera_id)
     if not cam:
         return None, 0.0
+    if is_ros_camera(cam):
+        if _ROS_MONITOR is None:
+            return None, 0.0
+        return _ROS_MONITOR.latest_ros_camera_frame(camera_id, max_age=max_age)
     return camera_worker(cam).latest_frame(max_age=max_age)
+
+
+def ros_camera_mjpeg_frames(camera_id: str):
+    cam = next((item for item in camera_config() if item.get("id") == camera_id), {})
+    use_sync = bool(cam.get("syncGroup")) and cam.get("streamSync", True) is not False
+    if not use_sync:
+        interval = 1.0 / max(1.0, min(float(cam.get("fps", 15)), 30.0))
+        while True:
+            if _ROS_MONITOR is None:
+                time.sleep(0.01)
+                continue
+            jpeg, _, _ = _ROS_MONITOR.latest_ros_camera_jpeg(
+                camera_id,
+                max_age=1.0,
+                wait_timeout=0.2,
+            )
+            if jpeg:
+                yield b"--frame\r\nContent-Type: image/jpeg\r\nCache-Control: no-store\r\n\r\n" + jpeg + b"\r\n"
+                time.sleep(interval)
+            else:
+                time.sleep(0.01)
+
+    last_sync_seq = 0
+    while True:
+        sync_seq, sync_time = wait_sync_tick(last_sync_seq)
+        last_sync_seq = sync_seq
+        if _ROS_MONITOR is None:
+            time.sleep(0.01)
+            continue
+        jpeg, _, _ = _ROS_MONITOR.latest_ros_camera_jpeg(
+            camera_id,
+            max_age=0.6,
+            wait_timeout=0.08,
+            min_stamp=sync_time,
+        )
+        if jpeg:
+            yield b"--frame\r\nContent-Type: image/jpeg\r\nCache-Control: no-store\r\n\r\n" + jpeg + b"\r\n"
+        else:
+            time.sleep(0.01)
+
+
+def fallback_ros_mjpeg_frame(camera_id: str, boundary: bytes = b"boundarydonotcross", max_age: float = 3.0) -> bytes:
+    if _ROS_MONITOR is None:
+        return b""
+    jpeg, _, _ = _ROS_MONITOR.latest_ros_camera_jpeg(
+        camera_id,
+        max_age=max_age,
+        wait_timeout=0.08,
+    )
+    if not jpeg:
+        return b""
+    return b"--" + boundary + b"\r\nContent-Type: image/jpeg\r\nCache-Control: no-store\r\n\r\n" + jpeg + b"\r\n"
+
+
+def web_video_mjpeg_frames(cam: dict[str, Any]):
+    config = web_video_server_config()
+    topic = web_video_request_topic(cam)
+    camera_id = str(cam.get("id", ""))
+    boundary = b"boundarydonotcross"
+    params = [
+        f"topic={quote(topic, safe='/')}",
+        f"type={quote(str(cam.get('webVideoStreamType', config.get('streamType', 'mjpeg'))), safe='')}",
+        f"quality={int(cam.get('webVideoQuality', config.get('quality', 80)))}",
+    ]
+    qos_profile = str(cam.get("webVideoQosProfile", "")).strip()
+    if qos_profile:
+        params.append(f"qos_profile={quote(qos_profile, safe='')}")
+    path = f"/stream?{'&'.join(params)}"
+    while True:
+        conn: http.client.HTTPConnection | None = None
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", int(config.get("port", 8080)), timeout=10)
+            conn.request("GET", path, headers={"Cache-Control": "no-store"})
+            response = conn.getresponse()
+            if response.status >= 400:
+                fallback = fallback_ros_mjpeg_frame(camera_id, boundary=boundary)
+                if fallback:
+                    yield fallback
+                time.sleep(0.25)
+                continue
+            delivered = False
+            while True:
+                chunk = response.read(65536)
+                if not chunk:
+                    break
+                delivered = True
+                yield chunk
+            if not delivered:
+                fallback = fallback_ros_mjpeg_frame(camera_id, boundary=boundary)
+                if fallback:
+                    yield fallback
+        except Exception:
+            fallback = fallback_ros_mjpeg_frame(camera_id, boundary=boundary)
+            if fallback:
+                yield fallback
+            time.sleep(0.25)
+        finally:
+            if conn is not None:
+                conn.close()
+
+
+def latest_ros_camera_mjpeg_frames(cam: dict[str, Any]):
+    camera_id = str(cam.get("id", ""))
+    boundary = b"boundarydonotcross"
+    interval = 1.0 / max(1.0, min(float(cam.get("fps", 15)), 30.0))
+    max_age = float(cam.get("streamMaxFrameAgeSec", cam.get("liveTimeoutSec", 3.0)))
+    while True:
+        if _ROS_MONITOR is None:
+            time.sleep(0.02)
+            continue
+        jpeg, _, _ = _ROS_MONITOR.latest_ros_camera_jpeg(
+            camera_id,
+            max_age=max_age,
+            wait_timeout=min(interval, 0.08),
+        )
+        if jpeg:
+            yield b"--" + boundary + b"\r\nContent-Type: image/jpeg\r\nCache-Control: no-store\r\n\r\n" + jpeg + b"\r\n"
+            time.sleep(interval)
+        else:
+            time.sleep(0.02)
 
 
 @app.get("/api/camera-frame/{camera_id}.jpg")
@@ -1852,11 +3271,25 @@ def get_camera_frame(camera_id: str) -> Response:
     cam = cams.get(camera_id)
     if not cam:
         raise HTTPException(status_code=404, detail="unknown camera")
-    if not Path(cam["device"]).exists():
+    if not is_ros_camera(cam) and not Path(cam["device"]).exists():
         raise HTTPException(status_code=404, detail=f"camera device missing: {cam['device']}")
     if str(cam.get("role", "")) == "depth-z16":
         return get_depth_view()
-    jpeg, stamp, seq = camera_worker(cam).latest_jpeg(max_age=0.45, wait_timeout=0.25)
+    fps = max(1, int(cam.get("fps", sync_fps())))
+    wait_timeout = min(0.35, max(0.12, (2.0 / float(fps)) + 0.05))
+    if is_ros_camera(cam):
+        if _ROS_MONITOR is None:
+            raise HTTPException(status_code=503, detail="ROS monitor not started")
+        jpeg, stamp, seq = _ROS_MONITOR.latest_ros_camera_jpeg(
+            camera_id,
+            max_age=1.5,
+            wait_timeout=wait_timeout,
+        )
+    else:
+        jpeg, stamp, seq = camera_worker(cam).latest_jpeg(
+            max_age=0.45,
+            wait_timeout=wait_timeout,
+        )
     if not jpeg:
         raise HTTPException(status_code=503, detail=f"camera frame unavailable: {cam['id']}")
     return Response(
@@ -1878,10 +3311,22 @@ def stream_camera(camera_id: str) -> StreamingResponse:
     if camera_id not in cams:
         raise HTTPException(status_code=404, detail="unknown camera")
     cam = cams[camera_id]
-    if not Path(cam["device"]).exists():
+    if not is_ros_camera(cam) and not Path(cam["device"]).exists():
         raise HTTPException(status_code=404, detail=f"camera device missing: {cam['device']}")
     if str(cam.get("role", "")) == "depth-z16":
         return stream_depth_view()
+    if is_ros_camera(cam) and str(cam.get("webVideoStreamType", "")).lower() == "fms_latest":
+        return StreamingResponse(
+            latest_ros_camera_mjpeg_frames(cam),
+            media_type="multipart/x-mixed-replace; boundary=boundarydonotcross",
+        )
+    if is_ros_camera(cam) and camera_uses_web_video(cam):
+        return StreamingResponse(
+            web_video_mjpeg_frames(cam),
+            media_type="multipart/x-mixed-replace; boundary=boundarydonotcross",
+        )
+    if is_ros_camera(cam):
+        return StreamingResponse(ros_camera_mjpeg_frames(camera_id), media_type="multipart/x-mixed-replace; boundary=frame")
     return StreamingResponse(camera_worker(cam).mjpeg_frames(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 
@@ -1889,7 +3334,7 @@ def stream_camera(camera_id: str) -> StreamingResponse:
 def start_ros_monitor() -> None:
     global _ROS_MONITOR
     start_sync_clock()
-    robot_id = os.getenv("FMS_ROBOT", "unitree")
+    robot_id = os.getenv("FMS_ROBOT", "ai_worker")
     _ROS_MONITOR = RosMonitor(robot_id)
     _ROS_MONITOR.start()
 

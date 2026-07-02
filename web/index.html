@@ -55,15 +55,32 @@
 
         <div class="main-stage">
           <section class="panel mission-shell-panel">
-            <div class="mission-panel" data-machine-state="0" aria-label="Mission state">
+            <div class="mission-panel" id="mission-panel-a" data-section="a" data-machine-state="0" aria-label="A section mission state">
               <div class="mission-head">
-                <span>Mission</span>
-                <strong class="mission-ok-label" id="mission-stage" hidden>MISSION OK</strong>
-                <i class="mission-ok-sign" id="mission-ok" aria-hidden="true"></i>
+                <span id="mission-label-a">A구간</span>
+                <strong class="mission-fail-label" id="mission-stage-a">인지 안됨</strong>
               </div>
               <div class="mission-state">
-                <span id="mission-topic">/machine_state</span>
-                <b id="mission-last">waiting for ROS</b>
+                <span id="mission-topic-a">/machine_state_a</span>
+                <b id="mission-last-a">waiting for ROS</b>
+              </div>
+            </div>
+            <div class="mission-panel mission-panel-b" id="mission-panel-b" data-section="b" data-machine-state="0" aria-label="B section move state">
+              <div class="mission-head">
+                <span id="mission-label-b">B구간</span>
+              </div>
+              <div class="mission-state">
+                <b id="mission-last-b">F9 Start / F10 Finish</b>
+              </div>
+            </div>
+            <div class="mission-panel" id="mission-panel-c" data-section="c" data-machine-state="0" aria-label="C section mission state">
+              <div class="mission-head">
+                <span id="mission-label-c">C구간</span>
+                <strong class="mission-fail-label" id="mission-stage-c">인지 안됨</strong>
+              </div>
+              <div class="mission-state">
+                <span id="mission-topic-c">/machine_state_c</span>
+                <b id="mission-last-c">waiting for ROS</b>
               </div>
             </div>
           </section>
@@ -153,6 +170,6 @@
         }
       }
     </script>
-    <script type="module" src="/app.js?v=20260702-machine-state-timeout"></script>
+    <script type="module" src="/app.js?v=20260702-mission-camera-fix"></script>
   </body>
 </html>

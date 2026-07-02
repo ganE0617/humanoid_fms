@@ -6,28 +6,41 @@ services:
     image: humanoid-fms:local
     container_name: humanoid-fms
     network_mode: host
-    pid: host
     ipc: host
+    cap_add:
+      - IPC_LOCK
+    devices:
+      - /dev/snd:/dev/snd
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     environment:
-      FMS_HOST: "127.0.0.1"
+      FMS_HOST: "0.0.0.0"
       FMS_PORT: "8787"
       FMS_ENABLE_ROS: "1"
-      FMS_ROBOT: "unitree"
+      FMS_ROBOT: "ai_worker"
+      FMS_AUDIO_BACKEND: "${FMS_AUDIO_BACKEND:-pulse}"
+      FMS_AUDIO_DEVICE: "${FMS_AUDIO_DEVICE:-alsa_output.platform-sound.analog-stereo}"
+      FMS_PULSE_SERVER: "${FMS_PULSE_SERVER:-unix:/run/user/1000/pulse/native}"
+      FMS_PULSE_SINK: "${FMS_PULSE_SINK:-alsa_output.platform-sound.analog-stereo}"
+      PULSE_SERVER: "${PULSE_SERVER:-unix:/run/user/1000/pulse/native}"
       FMS_CAMERA_SYNC_FPS: "20"
+      FMS_WEB_VIDEO_PORT: "18080"
       FMS_CYCLONEDDS_INTERFACE: "${FMS_CYCLONEDDS_INTERFACE:-}"
-      ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-0}"
-      RMW_IMPLEMENTATION: "${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
+      ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-30}"
+      RMW_IMPLEMENTATION: "rmw_zenoh_cpp"
+      ZENOH_CONFIG_OVERRIDE: "transport/shared_memory/enabled=true"
       CYCLONEDDS_URI: "${CYCLONEDDS_URI:-}"
     volumes:
       - ./config:/app/config:ro
       - ./web:/app/web:ro
-      - ./vendor:/app/vendor:ro
+      - ./fms_server.py:/app/fms_server.py:ro
+      - /home/robotis/ai_worker:/app/vendor/ai_worker:ro
       - ./logs:/app/logs
       - /dev:/dev
+      - /dev/shm:/dev/shm
+      - /run/user/1000/pulse:/run/user/1000/pulse
+      - /home/robotis/.config/pulse:/root/.config/pulse:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    device_cgroup_rules:
-      - "c 81:* rwm"
-    group_add:
-      - "44"
-      - "104"
     restart: unless-stopped
