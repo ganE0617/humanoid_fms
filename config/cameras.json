@@ -1,46 +1,105 @@
 [
   {
-    "id": "logitech_front",
-    "label": "Logitech C922 A",
-    "role": "front",
-    "device": "/dev/logitech1_camera",
-    "captureCandidates": ["/dev/logitech1_camera", "/dev/video0"],
-    "resolution": [640, 360],
-    "fps": 30,
-    "jpegQuality": 88,
-    "fov": 78
-  },
-  {
-    "id": "logitech_rear",
-    "label": "Logitech C922 B",
-    "role": "rear",
-    "device": "/dev/logitech2_camera",
-    "captureCandidates": ["/dev/logitech2_camera", "/dev/video3"],
-    "resolution": [640, 360],
-    "fps": 30,
-    "jpegQuality": 88,
-    "fov": 78
-  },
-  {
-    "id": "realsense_rgb",
-    "label": "RealSense D435i",
-    "role": "depth-rgb",
-    "device": "/dev/realsense_camera",
-    "captureCandidates": ["/dev/realsense_camera", "/dev/video6", "/dev/video8"],
-    "resolution": [640, 480],
-    "fps": 30,
-    "jpegQuality": 88,
+    "id": "realsense_left",
+    "label": "RealSense D405 Left",
+    "role": "ai-worker-left",
+    "source": "ros",
+    "syncGroup": "ai_worker_realsense",
+    "device": "/camera_left/camera_l/color/image_rect_raw/compressed",
+    "webVideoTopic": "/camera_left/camera_l/color/image_rect_raw/compressed",
+    "webVideoRequestTopic": "/camera_left/camera_l/color/image_rect_raw/compressed",
+    "webVideoStreamType": "ros_compressed",
+    "webVideoQosProfile": "sensor_data",
+    "webVideoQuality": 60,
+    "liveTimeoutSec": 3.0,
+    "topicCandidates": [],
+    "compressedTopicCandidates": [
+      "/camera_left/camera_l/color/image_rect_raw/compressed"
+    ],
+    "resolution": [
+      640,
+      480
+    ],
+    "fps": 16,
+    "jpegQuality": 72,
     "fov": 87
   },
   {
-    "id": "aux_4",
-    "label": "RealSense Depth",
-    "role": "depth-z16",
-    "device": "/dev/video4",
-    "captureCandidates": ["/dev/video4"],
-    "resolution": [640, 480],
-    "fps": 30,
-    "jpegQuality": 88,
+    "id": "realsense_right",
+    "label": "RealSense D405 Right",
+    "role": "ai-worker-right",
+    "source": "ros",
+    "syncGroup": "ai_worker_realsense",
+    "device": "/camera_right/camera_r/color/image_rect_raw/compressed",
+    "webVideoTopic": "/camera_right/camera_r/color/image_rect_raw/compressed",
+    "webVideoRequestTopic": "/camera_right/camera_r/color/image_rect_raw/compressed",
+    "webVideoStreamType": "ros_compressed",
+    "webVideoQosProfile": "sensor_data",
+    "webVideoQuality": 60,
+    "liveTimeoutSec": 3.0,
+    "topicCandidates": [],
+    "compressedTopicCandidates": [
+      "/camera_right/camera_r/color/image_rect_raw/compressed"
+    ],
+    "resolution": [
+      640,
+      480
+    ],
+    "fps": 16,
+    "jpegQuality": 72,
     "fov": 87
+  },
+  {
+    "id": "realsense_d455",
+    "label": "RealSense D455",
+    "role": "head-rgb",
+    "source": "ros",
+    "syncGroup": "ai_worker_realsense",
+    "device": "/camera_head/camera_head/color/image_raw/compressed",
+    "webVideoTopic": "/camera_head/camera_head/color/image_raw/compressed",
+    "webVideoRequestTopic": "/camera_head/camera_head/color/image_raw/compressed",
+    "webVideoStreamType": "fms_latest",
+    "webVideoQosProfile": "sensor_data",
+    "webVideoQuality": 60,
+    "liveTimeoutSec": 3.5,
+    "streamMaxFrameAgeSec": 3.5,
+    "displayFilter": "brightness(1.35) contrast(1.08)",
+    "topicCandidates": [],
+    "compressedTopicCandidates": [
+      "/camera_head/camera_head/color/image_raw/compressed",
+      "/camera_head/color/image_raw/compressed"
+    ],
+    "resolution": [
+      640,
+      480
+    ],
+    "fps": 15,
+    "jpegQuality": 72,
+    "fov": 87
+  },
+  {
+    "id": "logitech_c922",
+    "label": "Logitech C922",
+    "role": "webcam",
+    "source": "ros",
+    "streamSync": false,
+    "device": "/web_camera/image_raw/compressed",
+    "webVideoTopic": "/web_camera/image_raw/compressed",
+    "webVideoRequestTopic": "/web_camera/image_raw/compressed",
+    "webVideoStreamType": "ros_compressed",
+    "webVideoQosProfile": "sensor_data",
+    "webVideoQuality": 60,
+    "liveTimeoutSec": 3.0,
+    "topicCandidates": [],
+    "compressedTopicCandidates": [
+      "/web_camera/image_raw/compressed"
+    ],
+    "resolution": [
+      640,
+      480
+    ],
+    "fps": 15,
+    "jpegQuality": 72,
+    "fov": 78
   }
 ]

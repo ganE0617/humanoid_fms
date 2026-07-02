@@ -4,84 +4,106 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Humanoid FMS</title>
-    <link rel="stylesheet" href="/styles.css?v=20260619-lowlatency-sync" />
+    <link rel="stylesheet" href="/styles.css?v=20260702-camera-ratio-tune" />
   </head>
-  <body class="adapter-collapsed status-collapsed">
+  <body class="adapter-collapsed status-collapsed scene-collapsed">
     <main class="shell">
       <header class="topbar">
         <div class="brand">
           <div class="mark"></div>
           <div>
             <h1>Humanoid FMS</h1>
-            <p>Local teleop console</p>
+            <p>Local robot console</p>
           </div>
         </div>
         <div class="connection-strip">
           <span id="clock">--:--:--</span>
           <span class="pill good" id="runtime-pill">localhost</span>
           <span class="pill" id="robot-pill">Unitree</span>
-          <button class="small-button panel-toggle" data-toggle-panel="adapter">Adapter</button>
+          <button class="small-button panel-toggle" data-toggle-panel="adapter">Audio</button>
+          <button class="small-button panel-toggle" data-toggle-panel="scene">3D View</button>
           <button class="small-button panel-toggle" data-toggle-panel="status">Status</button>
-          <button id="refresh-btn" class="small-button">Refresh</button>
         </div>
       </header>
 
       <section class="workspace">
         <aside class="left-rail">
-          <section class="panel robot-panel">
-            <div class="panel-title">
-              <span>Robot Adapter</span>
-              <strong id="adapter-state">READY</strong>
+          <section class="panel audio-panel audio-rail-panel" aria-label="Audio playback">
+            <div class="audio-head">
+              <div>
+                <span>Audio</span>
+                <small id="audio-device">speaker waiting</small>
+              </div>
+              <strong id="audio-state">READY</strong>
             </div>
-            <label class="field-label" for="robot-select">Target</label>
-            <select id="robot-select"></select>
-            <div id="topic-map" class="topic-map"></div>
-          </section>
-
-          <section class="panel teleop-panel">
-            <div class="panel-title">
-              <span>Teleop Gate</span>
-              <strong id="teleop-state">LOCKED</strong>
+            <div class="audio-controls">
+              <label class="audio-upload">
+                <input id="audio-file" type="file" accept="audio/mpeg,.mp3" multiple />
+                <span>SELECT MP3</span>
+              </label>
+              <button id="audio-upload-btn" class="audio-primary" type="button">UPLOAD</button>
+              <button id="audio-stop-btn" class="audio-danger" type="button">STOP</button>
             </div>
-            <button class="arm-button" id="arm-button">Hold To Arm</button>
-            <div class="drive-pad" aria-label="Drive preview">
-              <button data-drive="forward">W</button>
-              <button data-drive="left">A</button>
-              <button data-drive="stop">STOP</button>
-              <button data-drive="right">D</button>
-              <button data-drive="back">S</button>
+            <div class="audio-selected" id="audio-selected">No file selected</div>
+            <div class="audio-library">
+              <span>Library</span>
+              <b id="audio-count">0 files</b>
             </div>
-            <div class="meters">
-              <div><span>linear</span><b id="linear-meter">0.00</b></div>
-              <div><span>angular</span><b id="angular-meter">0.00</b></div>
-            </div>
+            <div class="audio-list" id="audio-list"></div>
           </section>
         </aside>
 
-        <section class="panel camera-panel">
-          <div class="panel-title">
-            <span>Camera Streams</span>
-            <strong id="camera-summary">0/4</strong>
-          </div>
-          <div class="mission-panel" aria-label="Mission signals">
-            <div class="mission-head">
-              <span>Mission</span>
-              <strong id="mission-stage">IDLE</strong>
+        <div class="main-stage">
+          <section class="panel mission-shell-panel">
+            <div class="mission-panel" id="mission-panel-a" data-section="a" data-machine-state="0" aria-label="A section mission state">
+              <div class="mission-head">
+                <span id="mission-label-a">A구간</span>
+                <strong class="mission-fail-label" id="mission-stage-a">인지 안됨</strong>
+              </div>
+              <div class="mission-state">
+                <span id="mission-topic-a">/machine_state_a</span>
+                <b id="mission-last-a">waiting for ROS</b>
+              </div>
             </div>
-            <div class="mission-actions">
-              <button data-mission="start">START</button>
-              <button data-mission="complete">END</button>
-              <button data-mission="ok">OK</button>
+            <div class="mission-panel mission-panel-b" id="mission-panel-b" data-section="b" data-machine-state="0" aria-label="B section move state">
+              <div class="mission-head">
+                <span id="mission-label-b">B구간</span>
+              </div>
+              <div class="mission-state">
+                <b id="mission-last-b">F9 Start / F10 Finish</b>
+              </div>
             </div>
-            <div class="mission-state">
-              <span id="mission-topic">/fms/mission_events</span>
-              <b id="mission-last">waiting</b>
+            <div class="mission-panel" id="mission-panel-c" data-section="c" data-machine-state="0" aria-label="C section mission state">
+              <div class="mission-head">
+                <span id="mission-label-c">C구간</span>
+                <strong class="mission-fail-label" id="mission-stage-c">인지 안됨</strong>
+              </div>
+              <div class="mission-state">
+                <span id="mission-topic-c">/machine_state_c</span>
+                <b id="mission-last-c">waiting for ROS</b>
+              </div>
             </div>
-          </div>
-          <div class="camera-grid" id="camera-grid"></div>
-        </section>
+          </section>
 
-        <section class="panel scene-panel">
+          <div class="stage-body" id="stage-body">
+          <section class="panel camera-panel">
+            <div class="panel-title">
+              <span>Camera Streams</span>
+              <strong id="camera-summary">0/4</strong>
+            </div>
+            <div class="camera-grid" id="camera-grid"></div>
+          </section>
+
+          <div
+            class="stage-resizer"
+            id="stage-resizer"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize camera and 3D view"
+            tabindex="0"
+          ></div>
+
+          <section class="panel scene-panel">
           <div class="panel-title">
             <span>3D View</span>
             <div class="scene-title-actions">
@@ -118,13 +140,16 @@
             <span id="scene-depth">depth waiting</span>
             <span id="scene-objects">0 objects</span>
           </div>
-        </section>
+          </section>
+          </div>
+        </div>
 
         <aside class="panel status-panel">
           <div class="panel-title">
             <span>Status</span>
             <strong id="status-age">--</strong>
           </div>
+          <div class="battery-summary" id="battery-summary"></div>
           <div class="tabs">
             <button class="tab active" data-tab="cameras">Cameras</button>
             <button class="tab" data-tab="ros">ROS 2</button>
@@ -145,6 +170,6 @@
         }
       }
     </script>
-    <script type="module" src="/app.js?v=20260619-lowlatency-sync"></script>
+    <script type="module" src="/app.js?v=20260702-mission-camera-fix"></script>
   </body>
 </html>

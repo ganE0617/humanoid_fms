@@ -1,10 +1,10 @@
 {
   "id": "ai_worker",
   "label": "ROBOTIS AI Worker",
-  "description": "Future ROS 2 robot adapter target.",
+  "description": "ROS 2 adapter for the currently running AI Worker container.",
   "urdf": {
     "source": "ffw_description",
-    "path": "vendor/ai_worker/ffw_description/urdf/ffw_bg2_rev4_follower/ffw_bg2_follower.urdf",
+    "path": "vendor/ai_worker/ffw_description/urdf/ffw_sg2_rev1_follower/ffw_sg2_follower.urdf",
     "rootFrame": "base_link"
   },
   "topics": {
@@ -13,31 +13,73 @@
     "tfStatic": "/tf_static",
     "odom": "/odom",
     "cmdVel": "/cmd_vel",
-    "pointCloud": "/camera/depth/color/points",
-    "depthImage": "/camera/depth/image_rect_raw",
-    "depthCameraInfo": "/camera/depth/camera_info",
+    "batteryLeft": "/ai_worker/battery/left/state",
+    "batteryRight": "/ai_worker/battery/right/state",
+    "pointCloud": "",
+    "depthImage": "",
+    "depthCameraInfo": "",
     "missionEvents": "/fms/mission_events"
   },
+  "mission": {
+    "machineStateAService": "/machine_state_a",
+    "machineStateCService": "/machine_state_c",
+    "taskAService": "/task",
+    "taskCService": "/task_c",
+    "graspPosesTopic": "/grasp_poses",
+    "taskStatusTopic": "/task/status",
+    "detectionConfidenceMin": 0.25,
+    "aSection": {
+      "label": "A구간",
+      "parts": ["domenut", "flangenut", "gearring", "hexnut", "spacerring"],
+      "counts": [1, 1, 1, 1, 1]
+    },
+    "cSection": {
+      "label": "C구간",
+      "parts": ["domenut", "flangenut", "gearring", "hexnut", "spacerring"]
+    },
+    "bSection": {
+      "label": "B구간"
+    }
+  },
   "depthSensor": {
-    "label": "AI Worker head depth",
-    "pointCloudTopic": "/camera/depth/color/points",
+    "label": "RealSense D455 depth",
+    "pointCloudTopic": "",
+    "pointCloudTopicCandidates": [],
+    "compressedDepthTopic": "/camera_head/camera_head/aligned_depth_to_color/image_raw/compressedDepth",
+    "compressedDepthTopicCandidates": [
+      "/camera_head/camera_head/aligned_depth_to_color/image_raw/compressedDepth"
+    ],
+    "depthImageTopic": "",
+    "depthImageTopicCandidates": [],
     "preferredFrames": [
+      "camera_head_depth_optical_frame",
+      "camera_head_color_optical_frame",
       "camera_depth_optical_frame",
-      "camera_color_optical_frame",
-      "head_depth_optical_frame"
+      "camera_color_optical_frame"
     ],
     "fallbackParentFrame": "head_link2",
-    "fallbackOpticalFrame": "camera_depth_optical_frame",
-    "fallbackOrigin": [0.16, 0.0, 0.02],
-    "fallbackRpy": [0.0, 0.2618, 0.0],
-    "fallbackDevice": "/dev/video4",
-    "fallbackResolution": [640, 480],
+    "fallbackOpticalFrame": "camera_head_depth_optical_frame",
+    "fallbackOrigin": [
+      0.011,
+      0.023,
+      0.039
+    ],
+    "fallbackRpy": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "fallbackDevice": "",
+    "fallbackResolution": [
+      640,
+      480
+    ],
     "fallbackFps": 30,
-    "depthRgbCameraId": "realsense_rgb",
+    "depthRgbCameraId": "realsense_d455",
     "depthViewMode": "depth_only",
-    "depthStreamFps": 15,
-    "assistUpdateInterval": 0.2,
-    "geometryUpdateInterval": 0.7,
+    "depthStreamFps": 1,
+    "assistUpdateInterval": 2.0,
+    "geometryUpdateInterval": 3.0,
     "depthScaleMeters": 0.001,
     "horizontalFovDeg": 87,
     "verticalFovDeg": 58,
@@ -45,29 +87,38 @@
     "farMeters": 3.0,
     "focusFarMeters": 1.05,
     "depthViewFarMeters": 1.4,
-    "depthViewResolution": [640, 480],
-    "maxPoints": 36000,
-    "surfaceStep": 3,
-    "surfaceMaxDepthDelta": 0.12,
-    "holeFill": true,
+    "depthViewResolution": [
+      640,
+      480
+    ],
+    "maxPoints": 600,
+    "surfaceStep": 12,
+    "surfaceMaxDepthDelta": 0.16,
+    "holeFill": false,
     "holeFillMedian": 5,
-    "spatialFilter": true,
+    "spatialFilter": false,
     "bilateralDiameter": 5,
     "bilateralSigmaColorMeters": 0.05,
     "bilateralSigmaSpace": 5.0,
-    "temporalAlpha": 0.45,
+    "temporalAlpha": 0.0,
     "temporalMaxDeltaMeters": 0.18,
     "componentFilter": true,
     "componentMinPixels": 80,
     "componentOpenIterations": 1,
     "componentCloseIterations": 1,
-    "objectSegmentation": true,
-    "roiXMeters": [-0.55, 0.55],
-    "roiYMeters": [-0.45, 0.45],
-    "planeRemoval": true,
+    "objectSegmentation": false,
+    "roiXMeters": [
+      -0.55,
+      0.55
+    ],
+    "roiYMeters": [
+      -0.45,
+      0.45
+    ],
+    "planeRemoval": false,
     "planeDistanceThreshold": 0.025,
     "planeIterations": 140,
-    "planeSamplePoints": 6500,
+    "planeSamplePoints": 3000,
     "planeMinInliers": 900,
     "clusterMinPixels": 140,
     "clusterMaxPixels": 90000,
@@ -82,12 +133,15 @@
     "assistCenterY": 0.52,
     "assistRoiWidth": 0.24,
     "assistRoiHeight": 0.34,
-    "assistOverlayResolution": [640, 360]
+    "assistOverlayResolution": [
+      640,
+      360
+    ]
   },
   "cameraSlots": [
-    "logitech_front",
-    "logitech_rear",
-    "realsense_rgb",
-    "aux_4"
+    "realsense_left",
+    "realsense_right",
+    "realsense_d455",
+    "logitech_c922"
   ]
 }
