@@ -89,10 +89,14 @@ function cssEscape(value) {
   return String(value).replace(/["\\]/g, "\\$&");
 }
 
-function fetchJson(path) {
-  return fetch(path, { cache: "no-store" }).then((response) => {
+function fetchJson(path, options = {}) {
+  const controller = options.timeoutMs ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), options.timeoutMs) : null;
+  return fetch(path, { cache: "no-store", signal: controller?.signal }).then((response) => {
     if (!response.ok) throw new Error(`${path} ${response.status}`);
     return response.json();
+  }).finally(() => {
+    if (timer) clearTimeout(timer);
   });
 }
 
@@ -356,11 +360,21 @@ function renderDepthAssist(depth) {
 
 async function refreshMissionState() {
   try {
-    state.missionState = await fetchJson("/api/mission-state");
+    state.missionState = await fetchJson("/api/mission-state", { timeoutMs: 1500 });
     renderMissionPanel();
   } catch (error) {
-    setText("#mission-stage", "OFFLINE");
-    setText("#mission-last", "mission API offline");
+    state.missionState = {
+      stage: "offline",
+      events: [],
+      machineState: {
+        service: "/machine_state",
+        state: 0,
+        available: false,
+        updated: 0,
+        error: "mission API offline",
+      },
+    };
+    renderMissionPanel();
   }
 }
 
@@ -388,12 +402,13 @@ function renderMissionPanel() {
   setText("#mission-topic", machine.service || "/machine_state");
   const rosTimes = [Number(machine.updated || 0)].filter((value) => value > 0);
   const latestRos = rosTimes.length ? Math.max(...rosTimes) : 0;
+  const serviceError = String(machine.error || "");
   const notice = state.missionNotice && state.missionNotice.until > Date.now() ? state.missionNotice : null;
   const label = notice
     ? notice.text
     : latestRos
       ? `ROS ${new Date(latestRos * 1000).toLocaleTimeString("en-GB", { hour12: false })}`
-      : "waiting for ROS";
+      : serviceError || "waiting for ROS";
   setText("#mission-last", label);
   const panel = $(".mission-panel");
   if (panel) {

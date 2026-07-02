@@ -976,6 +976,14 @@ class RosMonitor:
         self.mission_stage = "idle"
         self.mission_queue: list[dict[str, Any]] = []
         self.mission_events: list[dict[str, Any]] = []
+        self.machine_state_service = "/machine_state"
+        self.machine_state: dict[str, Any] = {
+            "service": self.machine_state_service,
+            "state": 0,
+            "available": False,
+            "updated": 0.0,
+            "error": "not started",
+        }
         self.thread = threading.Thread(target=self._run, name="fms-ros-monitor", daemon=True)
         self.depth_thread = threading.Thread(target=self._run_depth_fallback, name="fms-depth-stream", daemon=True)
         self.depth_geometry_thread = threading.Thread(target=self._run_depth_geometry, name="fms-depth-geometry", daemon=True)
@@ -1028,6 +1036,7 @@ class RosMonitor:
                 "seq": self.mission_seq,
                 "topic": topic,
                 "events": self.mission_events[-8:],
+                "machineState": dict(self.machine_state),
             }
 
     def send_mission_signal(self, signal: str) -> dict[str, Any]:
@@ -1215,6 +1224,7 @@ class RosMonitor:
         robots = robot_configs()
         robot = robots.get(self.robot_id) or robots.get("unitree") or {}
         topics = robot.get("topics", {})
+        mission_config = robot.get("mission", {})
         joint_topic = topics.get("jointStates", "/joint_states")
         tf_topic = topics.get("tf", "/tf")
         tf_static_topic = topics.get("tfStatic", "/tf_static")
@@ -1224,6 +1234,8 @@ class RosMonitor:
         depth_config = robot.get("depthSensor", {})
         point_cloud_topic = depth_config.get("pointCloudTopic") or topics.get("pointCloud", "")
         mission_topic = topics.get("missionEvents", "/fms/mission_events")
+        machine_state_service = mission_config.get("machineStateService", "/machine_state")
+        machine_state_service_type = mission_config.get("machineStateServiceType", "")
         max_depth_points = max(100, min(80000, int(depth_config.get("maxPoints", 2400))))
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -1248,12 +1260,36 @@ class RosMonitor:
             except Exception as exc:
                 low_state_error = f"{type(exc).__name__}: {exc}"
 
+        def import_service_type(type_name: str):
+            normalized = str(type_name or "").strip().replace("/", ".")
+            parts = [part for part in normalized.split(".") if part]
+            if len(parts) < 3 or parts[-2] != "srv":
+                raise ValueError(f"unsupported service type: {type_name}")
+            return getattr(importlib.import_module(".".join(parts[:-1])), parts[-1])
+
+        def response_state_value(response: Any) -> int:
+            for attr in ("state", "data", "status", "mission_state", "machine_state"):
+                if hasattr(response, attr):
+                    try:
+                        return int(getattr(response, attr))
+                    except Exception:
+                        return 0
+            return 0
+
         try:
             rclpy.init(args=None)
 
             class FmsRosNode(Node):
                 def __init__(node_self):
                     super().__init__("humanoid_fms_monitor")
+                    node_self.machine_state_service = machine_state_service
+                    node_self.machine_state_service_type_name = machine_state_service_type
+                    node_self.machine_state_service_type = None
+                    node_self.machine_state_client = None
+                    node_self.machine_state_future = None
+                    node_self.machine_state_request_time = 0.0
+                    node_self.machine_state_next_attempt = 0.0
+                    node_self.machine_state_timeout = 0.8
                     node_self.create_subscription(JointState, joint_topic, node_self.on_joint, sensor_qos)
                     node_self.create_subscription(TFMessage, tf_topic, node_self.on_tf, sensor_qos)
                     node_self.create_subscription(TFMessage, tf_static_topic, node_self.on_tf, tf_static_qos)
@@ -1261,9 +1297,19 @@ class RosMonitor:
                         node_self.create_subscription(PointCloud2, point_cloud_topic, node_self.on_point_cloud, sensor_qos)
                     node_self.mission_pub = node_self.create_publisher(String, mission_topic, 10) if String else None
                     node_self.create_timer(0.1, node_self.publish_mission_events)
+                    node_self.create_timer(0.2, node_self.poll_machine_state)
                     if low_state_msg_type and low_state_joint_names:
                         for topic in {low_state_topic, low_state_lf_topic} - {""}:
                             node_self.create_subscription(low_state_msg_type, topic, node_self.on_low_state, sensor_qos)
+                    with self.lock:
+                        self.machine_state_service = machine_state_service
+                        self.machine_state = {
+                            "service": machine_state_service,
+                            "state": 0,
+                            "available": False,
+                            "updated": 0.0,
+                            "error": "waiting for service",
+                        }
 
                 def on_joint(node_self, msg):
                     now = time.time()
@@ -1352,6 +1398,77 @@ class RosMonitor:
                     except Exception as exc:
                         with self.lock:
                             self.depth_error = f"{type(exc).__name__}: {exc}"
+
+                def set_machine_state(node_self, state_value: int, available: bool, error: str = ""):
+                    with self.lock:
+                        self.machine_state = {
+                            "service": node_self.machine_state_service,
+                            "state": int(state_value),
+                            "available": bool(available),
+                            "updated": time.time() if available else 0.0,
+                            "error": error,
+                        }
+
+                def ensure_machine_state_client(node_self) -> bool:
+                    if node_self.machine_state_client is not None:
+                        return True
+                    service_type_name = node_self.machine_state_service_type_name
+                    if not service_type_name:
+                        for name, type_names in node_self.get_service_names_and_types():
+                            if name == node_self.machine_state_service and type_names:
+                                service_type_name = type_names[0]
+                                break
+                    if not service_type_name:
+                        node_self.set_machine_state(0, False, "service not found")
+                        return False
+                    try:
+                        node_self.machine_state_service_type = import_service_type(service_type_name)
+                        node_self.machine_state_service_type_name = service_type_name
+                        node_self.machine_state_client = node_self.create_client(
+                            node_self.machine_state_service_type,
+                            node_self.machine_state_service,
+                        )
+                        return True
+                    except Exception as exc:
+                        node_self.machine_state_client = None
+                        node_self.set_machine_state(0, False, f"{type(exc).__name__}: {exc}")
+                        return False
+
+                def poll_machine_state(node_self):
+                    now = time.time()
+                    if node_self.machine_state_future is not None:
+                        if node_self.machine_state_future.done():
+                            future = node_self.machine_state_future
+                            node_self.machine_state_future = None
+                            try:
+                                node_self.set_machine_state(response_state_value(future.result()), True, "")
+                            except Exception as exc:
+                                node_self.set_machine_state(0, False, f"{type(exc).__name__}: {exc}")
+                        elif now - node_self.machine_state_request_time > node_self.machine_state_timeout:
+                            try:
+                                node_self.machine_state_future.cancel()
+                            except Exception:
+                                pass
+                            node_self.machine_state_future = None
+                            node_self.set_machine_state(0, False, "service timeout")
+                        else:
+                            return
+                    if now < node_self.machine_state_next_attempt:
+                        return
+                    node_self.machine_state_next_attempt = now + 0.5
+                    if not node_self.ensure_machine_state_client():
+                        return
+                    try:
+                        if not node_self.machine_state_client.service_is_ready():
+                            if not node_self.machine_state_client.wait_for_service(timeout_sec=0.0):
+                                node_self.set_machine_state(0, False, "service unavailable")
+                                return
+                        request = node_self.machine_state_service_type.Request()
+                        node_self.machine_state_future = node_self.machine_state_client.call_async(request)
+                        node_self.machine_state_request_time = now
+                    except Exception as exc:
+                        node_self.machine_state_future = None
+                        node_self.set_machine_state(0, False, f"{type(exc).__name__}: {exc}")
 
                 def publish_mission_events(node_self):
                     if not node_self.mission_pub:
